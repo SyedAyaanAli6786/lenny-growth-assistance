@@ -82,14 +82,18 @@ def upgrade() -> None:
         sa.Column("embedding", Vector(768), nullable=False),
         sa.UniqueConstraint("source_id", "chunk_index", name="uq_chunk_source_index"),
     )
-    op.create_index(
-        "ix_transcript_chunks_embedding",
-        "transcript_chunks",
-        ["embedding"],
-        postgresql_using="ivfflat",
-        postgresql_with={"lists": "100"},
-        postgresql_ops={"embedding": "vector_cosine_ops"},
-    )
+    # No ANN index (ivfflat/hnsw) here deliberately: an ivfflat index built on
+    # an empty table (as this migration always runs against, before any
+    # ingestion) trains degenerate cluster centroids and silently produces
+    # badly wrong nearest-neighbor results — confirmed empirically in testing,
+    # where the actual best-matching transcript for a query never appeared in
+    # the indexed top-10 at all, but dominated the top-10 once the index was
+    # bypassed. At this project's scale (low thousands of chunks), an exact
+    # sequential scan is fast enough that the correctness risk of an
+    # improperly-trained approximate index isn't worth taking. Revisit with a
+    # `REINDEX`-after-ingest step (or switch to hnsw, which degrades more
+    # gracefully) if the knowledge base grows to a size where a full scan
+    # becomes the bottleneck.
 
 
 def downgrade() -> None:
