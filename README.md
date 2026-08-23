@@ -26,11 +26,13 @@ cp .env.example .env
 make up          # or: docker compose up --build
 ```
 
-This starts Postgres (with pgvector), Ollama, the FastAPI backend, and the frontend. On first boot, the `ollama-init` service pulls the configured chat + embedding models (a few GB — this can take a while the first time). Once it's up:
+This starts Postgres (with pgvector), Ollama, the FastAPI backend, and the frontend. On first boot, the `ollama-init` service pulls the configured chat + embedding models — `llama3.1:8b` is ~4.9GB, budget 5-15 minutes depending on your connection. Once it's up:
 
 ```bash
 make ingest       # populate the knowledge base from data/transcripts/
 ```
+
+**Timing, measured on CPU-only hardware (no GPU):** ingesting all 36 vendored transcripts takes **~40 minutes** (one embedding call per chunk, ~2,500 chunks total) — it's a one-time step, and safe to re-run anytime afterward (content-hash based, re-runs finish in seconds by skipping unchanged files). A single grounded chat reply from the default `llama3.1:8b` takes **~1-2 minutes** on CPU alone; a GPU or Apple Silicon (Metal) machine will be dramatically faster on both. If you want a faster demo loop while developing, swap `OLLAMA_MODEL` for a smaller model (see the env var table below) — ingestion time is dominated by the embedding model, not the chat model, so `OLLAMA_EMBED_MODEL` is what to swap for faster ingestion specifically.
 
 Then open **http://localhost:5173**.
 
@@ -93,6 +95,8 @@ See `tests/manual_test_plan.md` for the UI flows that need a human (rendering, t
 | Ship 30 essay looks off-format | The validator auto-repairs once; if the second draft still fails, that's surfaced as a warning in the backend logs (`ship30_repair_still_failing`) rather than silently returned as-is being hidden — check backend logs. |
 | Frontend can't reach the backend | Confirm `VITE_API_BASE_URL` matches where the backend is actually listening (`http://localhost:8000` by default) and that `CORS_ORIGINS` on the backend includes the frontend's origin. |
 | `alembic upgrade head` fails with a missing extension error | The `db` image must be `pgvector/pgvector:pg16` (already set in `docker-compose.yml`) — a plain `postgres` image won't have the `vector` extension available. |
+| A grounded question times out (`provider_timeout`, 504) | Expected on CPU-only hardware with the default `llama3.1:8b` if it takes longer than `PROVIDER_TIMEOUT_SECONDS` (240s default, already sized above the ~2-minute measured worst case) — raise it further, or switch to a smaller `OLLAMA_MODEL` for a faster loop. |
+| Answers cite a plausible-looking but *wrong* source (rare) | Retrieval intentionally uses an exact sequential scan, not an approximate index — see the comment in `backend/migrations/versions/0001_initial.py` for why an `ivfflat` index isn't used here (it silently produces wrong nearest-neighbors when built before ingestion, which is confirmed and documented, not a theoretical concern). |
 
 ## Repository layout
 
