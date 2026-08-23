@@ -1,0 +1,35 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+npm-debug.log*
+
+# Databases / volumes
+*.sqlite3
+pgdata/
+ollama_data/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Docs source
+Forward_Deployed_Engineer_Take_Home_Assignment.docx
