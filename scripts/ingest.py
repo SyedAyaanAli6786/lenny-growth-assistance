@@ -101,7 +101,7 @@ async def ingest_file(path: Path) -> None:
 
 
 async def main(transcripts_dir: Path) -> None:
-    files = sorted(transcripts_dir.glob("*.md"))
+    files = sorted(p for p in transcripts_dir.glob("*.md") if p.stem.lower() != "readme")
     if not files:
         logger.warning("no_transcript_files_found", path=str(transcripts_dir))
         return
