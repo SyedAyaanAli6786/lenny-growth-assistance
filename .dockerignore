@@ -1,0 +1,40 @@
+# Shared context filter for both backend/Dockerfile and frontend/Dockerfile
+# (both build with context: .). Without this, `frontend/Dockerfile`'s
+# `COPY frontend/ ./` after `npm install` would copy the HOST's
+# frontend/node_modules into the image, stomping the container's own
+# platform-specific install (e.g. esbuild's native binary) — and every
+# build would ship the whole repo, including backend/.venv, as context.
+
+.git/
+.gitignore
+.dockerignore
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/venv/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Node / frontend
+**/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+npm-debug.log*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Docs / misc not needed inside images
+*.md
+agent-transcripts/
+# Leading slash anchors to context root — do NOT use a bare "tests/" here,
+# it would also match backend/tests/, which the backend image needs for
+# `docker compose exec backend pytest` to find anything.
+/tests/
+Forward_Deployed_Engineer_Take_Home_Assignment.docx

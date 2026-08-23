@@ -9,8 +9,10 @@ COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app ./app
+COPY backend/tests ./tests
 COPY backend/migrations ./migrations
 COPY backend/alembic.ini ./alembic.ini
+COPY backend/pytest.ini ./pytest.ini
 COPY scripts ./scripts
 COPY data ./data
 
