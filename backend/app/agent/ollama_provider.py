@@ -26,7 +26,20 @@ class OllamaProvider(LLMProvider):
         payload_messages.extend({"role": m.role, "content": m.content} for m in messages)
 
         url = f"{self.settings.ollama_base_url}/api/chat"
-        payload = {"model": self.settings.ollama_model, "messages": payload_messages, "stream": False}
+        payload = {
+            "model": self.settings.ollama_model,
+            "messages": payload_messages,
+            "stream": False,
+            # We only ever read message.content, never message.thinking, so a
+            # hybrid-reasoning model's hidden thinking pass is pure overhead
+            # here — measured 15x latency on a trivial prompt with a
+            # thinking-capable model (qwen3:8b: ~36s -> ~2.5s), enough to push
+            # the longer Ship 30 prompt past provider_timeout_seconds
+            # entirely. Non-thinking models (e.g. llama3.1:8b) accept and
+            # ignore this flag with no effect — verified before enabling it
+            # unconditionally.
+            "think": False,
+        }
 
         try:
             async with httpx.AsyncClient(timeout=self.settings.provider_timeout_seconds) as client:
