@@ -12,7 +12,7 @@ export function ProviderToggle({ current, health, onChange, pending }: Props) {
   const ollamaOk = health?.ollama.status === "ok";
 
   return (
-    <div className="inline-flex overflow-hidden rounded-full border border-slate-300 text-xs font-medium">
+    <div className="inline-flex overflow-hidden rounded-full border border-slate-300 text-xs font-medium dark:border-slate-700">
       {(
         [
           { key: "anthropic" as const, label: "Claude (cloud)", available: anthropicOk },
@@ -31,7 +31,9 @@ export function ProviderToggle({ current, health, onChange, pending }: Props) {
             title={title}
             onClick={() => onChange(key)}
             className={`flex items-center gap-1.5 px-3 py-1.5 transition-colors ${
-              isActive ? "bg-slate-900 text-white" : "bg-white text-slate-600 hover:bg-slate-50"
+              isActive
+                ? "bg-brand-600 text-white"
+                : "bg-white text-slate-600 hover:bg-slate-50 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
             } ${disabled && !isActive ? "cursor-not-allowed opacity-40" : ""}`}
           >
             <span
