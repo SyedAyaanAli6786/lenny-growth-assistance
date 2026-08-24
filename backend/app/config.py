@@ -34,12 +34,18 @@ class Settings(BaseSettings):
     # Ops
     log_level: str = "INFO"
     cors_origins: str = "http://localhost:5173"
-    # CPU-only llama3.1:8b with a full RAG system prompt measured at 200s+ for
-    # a single reply in testing (no GPU). 240s gives headroom above that
-    # rather than have the mandatory local-demo path fail by default on
-    # exactly the hardware it's supposed to run on. A GPU/Apple Silicon
-    # machine will finish in a few seconds regardless of this ceiling.
-    provider_timeout_seconds: float = 240.0
+    # CPU-only, no GPU, measured worst case so far: a grounded chat reply
+    # ~200s (llama3.1:8b), and a full Ship 30 essay ~384s (qwen3:8b, with
+    # Ollama's "think" mode already disabled in ollama_provider.py — this is
+    # pure generation-length cost for a ~1000-word essay, not reasoning
+    # overhead). Each provider.generate() call — including a Ship 30 repair
+    # pass — gets its own independent timeout budget, not a combined one, so
+    # this only needs headroom above the single slowest call, not the sum of
+    # both. 500s gives that headroom rather than have the mandatory
+    # local-demo path fail by default on exactly the hardware/skill
+    # combination it's supposed to handle. A GPU/Apple Silicon machine
+    # finishes in seconds regardless of this ceiling.
+    provider_timeout_seconds: float = 500.0
 
     @property
     def cors_origin_list(self) -> list[str]:
