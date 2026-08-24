@@ -46,8 +46,19 @@ class AnthropicProvider(LLMProvider):
             model=self.settings.anthropic_model,
             # No filesystem/bash/network tools: this is a grounded-chat generation
             # call, not a coding agent, and the input is untrusted end-user text.
+            # `tools=[]` is what actually disables built-in tools from being
+            # offered at all — `allowed_tools` only controls which *offered*
+            # tools skip a permission prompt, it doesn't restrict what's
+            # offered, so tools=[] is required here, not optional. "dontAsk"
+            # (not "deny" — not a real PermissionMode value) means nothing
+            # gets prompted for and anything not pre-approved is denied,
+            # which is moot anyway since nothing is pre-approved and no tools
+            # exist to call. max_turns=1 additionally caps this to a single
+            # generation turn as defense in depth against any agentic looping.
+            tools=[],
             allowed_tools=[],
-            permission_mode="deny",
+            permission_mode="dontAsk",
+            max_turns=1,
         )
 
         try:
