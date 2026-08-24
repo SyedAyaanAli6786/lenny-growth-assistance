@@ -23,8 +23,9 @@ services:
   ollama:
     image: ollama/ollama:latest
     restart: unless-stopped
-    ports:
-      - "11434:11434"
+    # No host port mapping: the backend and ollama-init reach this over the
+    # internal compose network as `ollama:11434`, and exposing 11434 on the
+    # host risks colliding with a native Ollama install already using it.
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
@@ -59,14 +60,20 @@ services:
       DATABASE_URL: postgresql+asyncpg://lenny:lenny@db:5432/lenny
       OLLAMA_BASE_URL: http://ollama:11434
     ports:
-      - "8000:8000"
+      - "3400:3400"
     depends_on:
       db:
         condition: service_healthy
       ollama:
         condition: service_healthy
+      # Waits for the model pull to actually finish (exit 0), not just for
+      # the ollama server to be up — `docker compose up backend` alone is
+      # then genuinely self-contained instead of racing chat/embed calls
+      # against a still-downloading model.
+      ollama-init:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:3400/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -77,9 +84,9 @@ services:
       dockerfile: frontend/Dockerfile
     restart: unless-stopped
     environment:
-      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:3400}
     ports:
-      - "5173:5173"
+      - "3500:3500"
     depends_on:
       - backend
 

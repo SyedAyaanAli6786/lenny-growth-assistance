@@ -3,7 +3,7 @@
 Automated tests (`backend/tests/`) cover the API/persistence/retrieval/validator
 contract. This plan covers what only a human clicking through the UI can verify:
 rendering, sandboxing behavior, and perceived failure states. Run after
-`make up` (+ `make ingest` once) with the frontend at http://localhost:5173.
+`make up` (+ `make ingest` once) with the frontend at http://localhost:3500.
 
 | # | Flow | Steps | Expected result |
 |---|---|---|---|

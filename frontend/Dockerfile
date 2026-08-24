@@ -11,6 +11,6 @@ RUN npm install
 
 COPY frontend/ ./
 
-EXPOSE 5173
+EXPOSE 3500
 
 CMD ["npm", "run", "dev"]
