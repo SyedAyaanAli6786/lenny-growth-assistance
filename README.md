@@ -48,7 +48,7 @@ PYTHONPATH=backend backend/.venv/bin/python3 -m scripts.ingest
 
 Then, in separate terminals:
 ```bash
-cd backend && ./.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 3400
+make backend    # or: cd backend && ./.venv/bin/uvicorn app.main:app --port 3400
 ```
 ```bash
 cd frontend && npm run dev     # port 3500 (vite.config.ts's default)

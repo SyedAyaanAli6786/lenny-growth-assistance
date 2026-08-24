@@ -1,7 +1,12 @@
-.PHONY: up down logs ingest test test-unit backend-shell
+.PHONY: up down logs ingest test test-unit backend-shell backend
 
 up:
 	docker compose up --build
+
+# Native backend (recommended path — see README). Reads settings from
+# backend/.env automatically; needs `docker compose up -d db` running first.
+backend:
+	cd backend && ./.venv/bin/uvicorn app.main:app --port 3400
 
 down:
 	docker compose down
