@@ -42,3 +42,25 @@ def _guess_title(content: str, fence_type: str) -> str | None:
         if title_match:
             return title_match.group(1).strip()
     return None
+
+
+def strip_artifact_fence(text: str) -> str:
+    """Replace the first fenced ```markdown/html block with a short pointer to
+    the artifact panel, keeping any surrounding prose the model wrote outside
+    the fence. Used for the chat-bubble display text so the raw fenced source
+    doesn't render twice — once (unrendered) in the bubble, once (rendered) in
+    the artifact panel.
+    """
+    match = _FENCE_RE.search(text)
+    if not match:
+        return text
+
+    fence_type = match.group(1).lower()
+    if not match.group(2).strip():
+        return text
+
+    label = "document" if fence_type == "markdown" else "HTML snippet"
+    placeholder = f"_Opened as a {label} in the panel →_"
+    before = text[: match.start()].strip()
+    after = text[match.end() :].strip()
+    return "\n\n".join(p for p in (before, placeholder, after) if p)

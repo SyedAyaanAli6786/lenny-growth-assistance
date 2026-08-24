@@ -109,7 +109,11 @@ async def _persist_turn(
     assistant_message = Message(
         session_id=session.id,
         role="assistant",
-        content=result.response.text,
+        # display_text, not the raw response: when the reply carries a fenced
+        # artifact block, the artifact panel already renders that content —
+        # showing it a second time, unrendered, in the chat bubble is
+        # redundant and (for HTML) looks broken inline.
+        content=result.display_text,
         provider=result.response.provider,
         citations=result.citations,
     )

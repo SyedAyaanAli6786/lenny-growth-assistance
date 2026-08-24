@@ -6,7 +6,7 @@ from app.agent.anthropic_provider import AnthropicProvider
 from app.agent.base import ChatMessage, LLMProvider, ProviderResponse
 from app.agent.ollama_provider import OllamaProvider
 from app.agent.skills.ship30 import build_repair_prompt, build_ship30_prompt, validate_ship30_draft
-from app.artifacts.detect import Artifact, detect_artifact
+from app.artifacts.detect import Artifact, detect_artifact, strip_artifact_fence
 from app.logging import get_logger
 from app.rag.retrieval import RetrievedChunk, retrieve
 
@@ -62,6 +62,19 @@ class OrchestrationResult:
     response: ProviderResponse
     citations: list[dict]
     artifact: Artifact | None
+    display_text: str  # what the chat bubble shows — artifact fences replaced with a pointer
+
+
+def _build_retrieval_query(history: list[ChatMessage]) -> str:
+    """A short follow-up like "the 1st one" or "what about that" carries no
+    retrievable signal by itself — folding in the prior assistant turn (if
+    any) gives the embedding something concrete to match against, since that's
+    almost always what a short follow-up is actually referring to.
+    """
+    latest = history[-1].content
+    if len(history) >= 2 and history[-2].role == "assistant":
+        return f"{history[-2].content}\n\n{latest}"
+    return latest
 
 
 async def respond(
@@ -73,8 +86,7 @@ async def respond(
     """Deterministic retrieve-then-generate: retrieval never depends on the model
     deciding to call a tool, so grounding behavior is identical across providers.
     """
-    latest_user_message = history[-1].content
-    retrieved = await retrieve(db, latest_user_message)
+    retrieved = await retrieve(db, _build_retrieval_query(history))
 
     if not retrieved and system_prompt_override is None:
         # Deterministic decline instead of a prompt-only instruction: testing
@@ -85,14 +97,12 @@ async def respond(
         # answer" hold regardless of how well a given model follows
         # instructions.
         logger.info("no_retrieval_short_circuit", provider=provider_name)
+        decline_text = "The transcripts I have don't cover this — I don't have grounded material to answer from."
         return OrchestrationResult(
-            response=ProviderResponse(
-                text="The transcripts I have don't cover this — I don't have grounded material to answer from.",
-                provider=provider_name,
-                model="n/a (no model call made)",
-            ),
+            response=ProviderResponse(text=decline_text, provider=provider_name, model="n/a (no model call made)"),
             citations=[],
             artifact=None,
+            display_text=decline_text,
         )
 
     system_prompt = system_prompt_override or GROUNDED_SYSTEM_PROMPT.format(sources=_format_sources(retrieved))
@@ -115,8 +125,11 @@ async def respond(
     ]
 
     artifact = detect_artifact(provider_response.text)
+    display_text = strip_artifact_fence(provider_response.text) if artifact else provider_response.text
 
-    return OrchestrationResult(response=provider_response, citations=citations, artifact=artifact)
+    return OrchestrationResult(
+        response=provider_response, citations=citations, artifact=artifact, display_text=display_text
+    )
 
 
 async def run_ship30(db: AsyncSession, provider_name: str, topic_message: ChatMessage) -> OrchestrationResult:
@@ -129,17 +142,15 @@ async def run_ship30(db: AsyncSession, provider_name: str, topic_message: ChatMe
         # Same rationale as the no-retrieval short-circuit in respond(): don't
         # ask the model to draft a "grounded" essay with nothing to ground it in.
         logger.info("ship30_no_retrieval_short_circuit", provider=provider_name)
+        decline_text = (
+            "I don't have transcript material on this topic to draft a grounded Ship 30 "
+            "essay from — try a product/growth topic covered in the knowledge base."
+        )
         return OrchestrationResult(
-            response=ProviderResponse(
-                text=(
-                    "I don't have transcript material on this topic to draft a grounded Ship 30 "
-                    "essay from — try a product/growth topic covered in the knowledge base."
-                ),
-                provider=provider_name,
-                model="n/a (no model call made)",
-            ),
+            response=ProviderResponse(text=decline_text, provider=provider_name, model="n/a (no model call made)"),
             citations=[],
             artifact=None,
+            display_text=decline_text,
         )
 
     system_prompt = build_ship30_prompt(_format_sources(retrieved))
@@ -157,8 +168,9 @@ async def run_ship30(db: AsyncSession, provider_name: str, topic_message: ChatMe
             logger.warning("ship30_repair_still_failing", issues=result.issues, word_count=result.word_count)
 
     artifact = detect_artifact(draft.text)
+    display_text = strip_artifact_fence(draft.text) if artifact else draft.text
     citations = [
         {"source_id": c.source_id, "chunk_id": c.chunk_id, "title": c.title, "guest": c.guest, "url": c.url, "score": c.score}
         for c in retrieved
     ]
-    return OrchestrationResult(response=draft, citations=citations, artifact=artifact)
+    return OrchestrationResult(response=draft, citations=citations, artifact=artifact, display_text=display_text)
