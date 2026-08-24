@@ -15,28 +15,58 @@ Retrieval is always a deterministic server-side step (never a model-decided tool
 
 ## Prerequisites
 
-- Docker + Docker Compose v2 (`docker compose version`)
-- ~8GB free RAM if running the default `llama3.1:8b` local model (see below for lighter alternatives)
+- **Ollama** installed natively (mandatory per the brief — the demo must run local inference): [ollama.com](https://ollama.com)
+- **Python 3.11+** and **Node 20+** for the backend/frontend
+- Docker (optional — see below)
+- ~8GB free RAM for an 8B-class local model (see below for lighter alternatives)
 - Optional: an Anthropic API key for the cloud path (`ANTHROPIC_API_KEY`) — **not required**, the local Ollama path works with zero keys
 
-## Quickstart (one command)
+## A note on Docker
+
+The brief asks for "a practical setup path, **ideally using Docker Compose or an equivalent reproducible workflow**" — Docker is a suggestion, not a requirement; only Ollama itself is mandatory. This repo's actual recommended path runs the backend and frontend **natively** (venv / `npm run dev`) against a **natively-installed Ollama**, using Docker only for the lightweight, disposable `db` (Postgres+pgvector) container — that avoids a system-wide Postgres install without any of Docker's heavier costs. A full `docker-compose.yml` is still included and works (`make up`) for anyone who prefers a single fully-containerized command, but be aware it pulls Ollama models into a **second, separate copy** inside a Docker volume — redundant (and multi-GB) if you already have Ollama running natively, which is exactly why the native path is the default recommendation here.
+
+## Quickstart (native — recommended)
+
+```bash
+cp .env.example .env
+cp .env.example backend/.env   # then edit ports/model in backend/.env if you want them to differ from .env
+
+ollama pull qwen3:8b           # or any model comfortable on your machine
+ollama pull nomic-embed-text   # embedding model, used for retrieval regardless of chat model
+
+docker compose up -d db        # Postgres+pgvector only — lightweight, no model downloads
+```
+
+Run migrations and ingest the knowledge base once:
+```bash
+cd backend
+export DATABASE_URL=postgresql+asyncpg://lenny:lenny@localhost:5433/lenny
+./.venv/bin/alembic upgrade head
+cd ..
+PYTHONPATH=backend backend/.venv/bin/python3 -m scripts.ingest
+```
+
+Then, in separate terminals:
+```bash
+cd backend && ./.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 3400
+```
+```bash
+cd frontend && npm run dev     # port 3500 (vite.config.ts's default)
+```
+
+Open **http://localhost:3500**.
+
+**Timing, measured on CPU-only hardware (no GPU):** ingesting all 36 vendored transcripts takes **~40 minutes** (one embedding call per chunk, ~2,500 chunks total) — it's a one-time step, and safe to re-run anytime afterward (content-hash based, re-runs finish in seconds by skipping unchanged files). A single grounded chat reply takes **~1-2 minutes** on CPU alone with an 8B-class model; a GPU or Apple Silicon (Metal) machine will be dramatically faster on both.
+
+## Quickstart (fully Dockerized alternative)
 
 ```bash
 cp .env.example .env
 make up          # or: docker compose up --build
 ```
+Starts Postgres, Docker's own Ollama (pulls `OLLAMA_MODEL`/`OLLAMA_EMBED_MODEL` into its own volume before `backend` finishes starting), the backend (port 3400), and frontend (port 3500) together — genuinely one command, no separate pull step, at the cost of a second model download if you already have Ollama natively. Then `make ingest`. Open **http://localhost:3500**.
 
-This starts Postgres (with pgvector), Ollama, the FastAPI backend, and the frontend. On first boot, the `ollama-init` service pulls the configured chat + embedding models — `llama3.1:8b` is ~4.9GB, budget 5-15 minutes depending on your connection. Once it's up:
-
-```bash
-make ingest       # populate the knowledge base from data/transcripts/
-```
-
-**Timing, measured on CPU-only hardware (no GPU):** ingesting all 36 vendored transcripts takes **~40 minutes** (one embedding call per chunk, ~2,500 chunks total) — it's a one-time step, and safe to re-run anytime afterward (content-hash based, re-runs finish in seconds by skipping unchanged files). A single grounded chat reply from the default `llama3.1:8b` takes **~1-2 minutes** on CPU alone; a GPU or Apple Silicon (Metal) machine will be dramatically faster on both. If you want a faster demo loop while developing, swap `OLLAMA_MODEL` for a smaller model (see the env var table below) — ingestion time is dominated by the embedding model, not the chat model, so `OLLAMA_EMBED_MODEL` is what to swap for faster ingestion specifically.
-
-Then open **http://localhost:5173**.
-
-The backend runs Alembic migrations automatically on startup. The `db` container's host-exposed port defaults to **5433** (not 5432), since many dev machines already run a local Postgres — the backend itself always talks to `db:5432` over the internal Docker network regardless.
+The backend runs Alembic migrations automatically on startup. The `db` container's host-exposed port defaults to **5433** (not 5432), since many dev machines already run a local Postgres — the backend itself always talks to `db:5432` over the internal Docker network regardless. Similarly, Docker's `ollama` service exposes no host port at all (only reachable at `ollama:11434` inside the compose network) specifically to avoid colliding with a native Ollama install already using host port 11434.
 
 ## Environment variables
 
@@ -53,35 +83,28 @@ See `.env.example` for the full annotated list. The essentials:
 
 ## Local vs. cloud model setup
 
-- **Local (mandatory demo path, zero keys required)**: `docker compose up` already brings up Ollama and pulls `OLLAMA_MODEL`/`OLLAMA_EMBED_MODEL`. Leave `LLM_PROVIDER=ollama` (the default) and it just works.
-- **Cloud**: set `ANTHROPIC_API_KEY` in `.env`, restart (`docker compose up -d backend`), then either set `LLM_PROVIDER=anthropic` or switch it live from the provider toggle in the top bar — no code changes, no rebuild.
+- **Local (mandatory demo path, zero keys required)**: install Ollama, `ollama pull` your chosen chat + embedding models, leave `LLM_PROVIDER=ollama` (the default), and it just works — no keys needed anywhere.
+- **Cloud**: set `ANTHROPIC_API_KEY` in `.env`/`backend/.env`, restart the backend, then either set `LLM_PROVIDER=anthropic` or switch it live from the provider toggle in the top bar — no code changes, no rebuild.
 
-## Running outside Docker (optional, for backend development)
+## First-time setup (native path)
 
-```bash
-cd backend
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export DATABASE_URL=postgresql+asyncpg://lenny:lenny@localhost:5433/lenny
-export OLLAMA_BASE_URL=http://localhost:11434
-alembic upgrade head
-uvicorn app.main:app --reload
-```
+Only needed once — installs the backend's Python deps into a venv and the frontend's npm deps:
 
 ```bash
-cd frontend
-npm install
-npm run dev
+cd backend && python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+cd ../frontend && npm install
 ```
+
+After that, the commands in "Quickstart (native — recommended)" above are all you need for every subsequent run.
 
 ## Tests
 
 ```bash
-make test          # full suite (pytest) inside the backend container
-make test-unit      # pure unit tests only — no live Postgres required
+cd backend && ./.venv/bin/pytest
 ```
+The retrieval/chunking/Ship 30 validator/artifact-detection tests are pure unit tests and always run; the API/persistence tests in `tests/test_sessions_api.py` need a reachable Postgres (`docker compose up -d db`) and skip gracefully with a clear reason if one isn't available.
 
-Or locally: `cd backend && pytest` — the retrieval/chunking/Ship 30 validator/artifact-detection tests are pure unit tests and always run; the API/persistence tests in `tests/test_sessions_api.py` need a reachable Postgres (`docker compose up -d db`) and skip gracefully with a clear reason if one isn't available.
+If you're using the fully-Dockerized alternative instead: `make test` (full suite inside the backend container) or `make test-unit` (pure unit tests only).
 
 See `tests/manual_test_plan.md` for the UI flows that need a human (rendering, the artifact sandbox, responsive/keyboard behavior).
 
@@ -90,12 +113,13 @@ See `tests/manual_test_plan.md` for the UI flows that need a human (rendering, t
 | Symptom | Likely cause / fix |
 |---|---|
 | `docker compose up` fails to bind port 5432 | Something else on the host already listens there — this repo maps the db container to host port **5433** by default for exactly this reason; check `POSTGRES_HOST_PORT` in `.env` if you changed it. |
-| Chat requests fail with `provider_unavailable` | Check `GET /health` — it reports `db`, `ollama`, and `anthropic` independently. For Ollama, confirm `docker compose ps` shows it healthy and the model finished pulling (`docker compose logs ollama-init`). |
+| `docker compose up` fails to bind port 11434 | A native Ollama install is already using it — Docker's own `ollama` service doesn't expose a host port at all by default for exactly this reason; if you changed that, revert it or stop the native install first. |
+| Chat requests fail with `provider_unavailable` | Check `GET http://localhost:3400/health` — it reports `db`, `ollama`, and `anthropic` independently. For Ollama, confirm `docker compose ps` shows it healthy and the model finished pulling (`docker compose logs ollama-init`). |
 | Every answer says "the transcripts don't cover this" | You haven't run `make ingest` yet, or `RETRIEVAL_MIN_SCORE` is too high for your embedding model — check `GET /api/sources` for ingested counts. |
 | Ship 30 essay looks off-format | The validator auto-repairs once; if the second draft still fails, that's surfaced as a warning in the backend logs (`ship30_repair_still_failing`) rather than silently returned as-is being hidden — check backend logs. |
-| Frontend can't reach the backend | Confirm `VITE_API_BASE_URL` matches where the backend is actually listening (`http://localhost:8000` by default) and that `CORS_ORIGINS` on the backend includes the frontend's origin. |
+| Frontend can't reach the backend | Confirm `VITE_API_BASE_URL` matches where the backend is actually listening (`http://localhost:3400` by default) and that `CORS_ORIGINS` on the backend includes the frontend's origin (`http://localhost:3500` by default). |
 | `alembic upgrade head` fails with a missing extension error | The `db` image must be `pgvector/pgvector:pg16` (already set in `docker-compose.yml`) — a plain `postgres` image won't have the `vector` extension available. |
-| A grounded question times out (`provider_timeout`, 504) | Expected on CPU-only hardware with the default `llama3.1:8b` if it takes longer than `PROVIDER_TIMEOUT_SECONDS` (240s default, already sized above the ~2-minute measured worst case) — raise it further, or switch to a smaller `OLLAMA_MODEL` for a faster loop. |
+| A grounded question times out (`provider_timeout`, 504) | Expected on CPU-only hardware if it takes longer than `PROVIDER_TIMEOUT_SECONDS` (500s default, sized above the measured worst case for a full Ship 30 essay) — raise it further, or switch to a smaller `OLLAMA_MODEL` for a faster loop. |
 | Answers cite a plausible-looking but *wrong* source (rare) | Retrieval intentionally uses an exact sequential scan, not an approximate index — see the comment in `backend/migrations/versions/0001_initial.py` for why an `ivfflat` index isn't used here (it silently produces wrong nearest-neighbors when built before ingestion, which is confirmed and documented, not a theoretical concern). |
 
 ## Repository layout
