@@ -17,9 +17,9 @@ const ASSISTANT_BUBBLE_CLASS =
   "prose prose-sm max-w-none rounded-2xl rounded-tl-sm bg-white px-4 py-2.5 text-slate-900 shadow-sm ring-1 ring-slate-200 prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5 first:prose-p:mt-0 last:prose-p:mb-0 dark:bg-slate-800 dark:text-slate-100 dark:ring-slate-700 dark:prose-invert";
 
 const SUGGESTIONS = [
-  "How should I think about activation for a PLG product?",
-  "What do Lenny's guests say about pricing experiments?",
-  "What separates good onboarding from great onboarding?",
+  "How do Lenny's guests define and use a North Star metric?",
+  "What do Lenny's guests say about improving user retention?",
+  "How should a product team think about prioritization?",
 ];
 
 function formatTime(iso: string): string {
