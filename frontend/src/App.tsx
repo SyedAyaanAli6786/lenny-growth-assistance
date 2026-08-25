@@ -32,9 +32,19 @@ export default function App() {
   const [activeSession, setActiveSession] = useState<SessionDetail | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [artifact, setArtifact] = useState<ArtifactData | null>(null);
-  const [pendingLabel, setPendingLabel] = useState<string | null>(null);
-  const [streamingText, setStreamingText] = useState<string | null>(null);
-  const [errorText, setErrorText] = useState<string | null>(null);
+  // Keyed by session id, not a single global value: a generation in progress
+  // belongs to the chat that started it, not to whatever chat happens to be
+  // on screen when a delta or the final reply arrives. Previously these were
+  // single top-level values, so switching chats mid-reply showed session A's
+  // in-progress text overlaid on session B, disabled the input for every
+  // chat regardless of which one was actually generating, and lost track of
+  // a background reply the moment you navigated away from it.
+  const [pendingBySession, setPendingBySession] = useState<Record<string, string>>({});
+  const [streamingBySession, setStreamingBySession] = useState<Record<string, string>>({});
+  const [errorBySession, setErrorBySession] = useState<Record<string, string>>({});
+  // Only for an error with no session to scope it to yet (session creation
+  // itself failing, before any session id exists).
+  const [draftErrorText, setDraftErrorText] = useState<string | null>(null);
   const [providerPending, setProviderPending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [draft, setDraft] = useState("");
@@ -44,6 +54,47 @@ export default function App() {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("lenny_theme", theme);
   }, [theme]);
+
+  const setPendingFor = useCallback((sessionId: string, label: string | null) => {
+    setPendingBySession((prev) => {
+      if (label === null) {
+        if (!(sessionId in prev)) return prev;
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      }
+      return { ...prev, [sessionId]: label };
+    });
+  }, []);
+
+  const initStreamingFor = useCallback((sessionId: string) => {
+    setStreamingBySession((prev) => ({ ...prev, [sessionId]: "" }));
+  }, []);
+
+  const appendStreamingFor = useCallback((sessionId: string, text: string) => {
+    setStreamingBySession((prev) => ({ ...prev, [sessionId]: (prev[sessionId] ?? "") + text }));
+  }, []);
+
+  const clearStreamingFor = useCallback((sessionId: string) => {
+    setStreamingBySession((prev) => {
+      if (!(sessionId in prev)) return prev;
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+  }, []);
+
+  const setErrorFor = useCallback((sessionId: string, message: string | null) => {
+    setErrorBySession((prev) => {
+      if (message === null) {
+        if (!(sessionId in prev)) return prev;
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      }
+      return { ...prev, [sessionId]: message };
+    });
+  }, []);
 
   const refreshHealth = useCallback(() => {
     api
@@ -68,7 +119,6 @@ export default function App() {
     const detail = await api.getSession(id);
     setActiveSession(detail);
     setArtifact(null);
-    setErrorText(null);
     setSidebarOpen(false);
   }, []);
 
@@ -78,30 +128,38 @@ export default function App() {
     });
   }, [loadSessions, openSession]);
 
-  const handleNewSession = useCallback(async () => {
-    // Mirror ChatGPT: don't pile up empty chats. A session's title is only
-    // ever set once its first message lands (see backend _derive_title), so
-    // title === null on the chat that's already open reliably means "nothing
-    // was ever sent here yet" — stay put instead of creating another empty
-    // one. (Deliberately scoped to the currently-open chat only, not a search
-    // across the whole sidebar history — reusing some unrelated old empty
-    // chat from way back would be a surprising place to land, not a "new"
-    // chat from the user's point of view.)
-    if (activeSession?.title === null) {
-      setSidebarOpen(false);
-      return;
-    }
-    const session = await api.createSession(undefined, pseudoUserId());
-    await loadSessions();
-    await openSession(session.id);
-  }, [activeSession, loadSessions, openSession]);
+  const handleNewSession = useCallback(() => {
+    // Lazy creation: no backend row is created here at all — only when a
+    // message actually gets sent (see runTurn below). Earlier this eagerly
+    // created a session on click, guarded by "reuse it if the current chat
+    // is still empty" — but that guard only covered the chat you were
+    // already on. Switch to a different (non-empty) chat first, then click
+    // "New chat," and the guard never fires: it created another empty
+    // session every time, leaving a trail of orphaned "Untitled session"
+    // rows behind (reported live: three in a row). Not creating anything
+    // until there's an actual message removes the whole failure mode
+    // instead of chasing more edge cases in the guard.
+    setActiveSession(null);
+    setArtifact(null);
+    setDraftErrorText(null);
+    setDraft("");
+    setSidebarOpen(false);
+  }, []);
+
+  const reportError = useCallback(
+    (message: string) => {
+      if (activeSession) setErrorFor(activeSession.id, message);
+      else setDraftErrorText(message);
+    },
+    [activeSession, setErrorFor],
+  );
 
   const handleDeleteSession = useCallback(
     async (id: string) => {
       try {
         await api.deleteSession(id);
       } catch (err) {
-        setErrorText(err instanceof ApiError ? err.message : "Could not delete this chat.");
+        reportError(err instanceof ApiError ? err.message : "Could not delete this chat.");
         return;
       }
       const list = await loadSessions();
@@ -113,81 +171,94 @@ export default function App() {
         }
       }
     },
-    [activeSession, loadSessions, openSession],
+    [activeSession, loadSessions, openSession, reportError],
   );
 
   const handleProviderChange = useCallback(
     async (provider: Provider) => {
       if (!activeSession) return;
       setProviderPending(true);
-      setErrorText(null);
+      setErrorFor(activeSession.id, null);
       try {
         const updated = await api.setProvider(activeSession.id, provider);
         setActiveSession((prev) => (prev ? { ...prev, llm_provider: updated.llm_provider, llm_model: updated.llm_model } : prev));
       } catch (err) {
-        setErrorText(err instanceof ApiError ? err.message : "Could not switch provider.");
+        setErrorFor(activeSession.id, err instanceof ApiError ? err.message : "Could not switch provider.");
       } finally {
         setProviderPending(false);
       }
     },
-    [activeSession],
+    [activeSession, setErrorFor],
   );
 
   const runShip30 = useCallback(
-    async (content: string, wasUntitled: boolean) => {
-      if (!activeSession) return;
-      setPendingLabel(`Drafting Ship 30 essay… (${activeSession.llm_provider})`);
+    async (session: SessionDetail, content: string, wasUntitled: boolean) => {
+      setPendingFor(session.id, `Drafting Ship 30 essay… (${session.llm_provider})`);
       try {
-        const turn = await api.generateShip30(activeSession.id, content);
-        setActiveSession((prev) => (prev ? { ...prev, messages: [...prev.messages, turn.message] } : prev));
+        const turn = await api.generateShip30(session.id, content);
+        setActiveSession((prev) => (prev && prev.id === session.id ? { ...prev, messages: [...prev.messages, turn.message] } : prev));
         if (turn.artifact) setArtifact(turn.artifact);
         if (wasUntitled) loadSessions();
       } catch (err) {
-        setErrorText(
+        setErrorFor(
+          session.id,
           err instanceof ApiError
             ? `${err.message}${err.component ? ` (${err.component})` : ""}`
             : "Something went wrong talking to the backend.",
         );
       } finally {
-        setPendingLabel(null);
+        setPendingFor(session.id, null);
       }
     },
-    [activeSession, loadSessions],
+    [loadSessions, setPendingFor, setErrorFor],
   );
 
   const runMessage = useCallback(
-    async (content: string, wasUntitled: boolean) => {
-      if (!activeSession) return;
-      const sessionId = activeSession.id;
-      setPendingLabel(`${activeSession.llm_provider === "ollama" ? "Ollama" : "Claude"} is thinking…`);
-      setStreamingText("");
+    async (session: SessionDetail, content: string, wasUntitled: boolean) => {
+      setPendingFor(session.id, `${session.llm_provider === "ollama" ? "Ollama" : "Claude"} is thinking…`);
+      initStreamingFor(session.id);
 
-      await api.streamMessage(sessionId, content, {
+      await api.streamMessage(session.id, content, {
         onDelta: (text) => {
-          setPendingLabel(null);
-          setStreamingText((prev) => (prev ?? "") + text);
+          setPendingFor(session.id, null);
+          appendStreamingFor(session.id, text);
         },
         onDone: (turn) => {
-          setPendingLabel(null);
-          setStreamingText(null);
-          setActiveSession((prev) => (prev ? { ...prev, messages: [...prev.messages, turn.message] } : prev));
+          setPendingFor(session.id, null);
+          clearStreamingFor(session.id);
+          setActiveSession((prev) => (prev && prev.id === session.id ? { ...prev, messages: [...prev.messages, turn.message] } : prev));
           if (turn.artifact) setArtifact(turn.artifact);
           if (wasUntitled) loadSessions();
         },
         onError: (message) => {
-          setPendingLabel(null);
-          setStreamingText(null);
-          setErrorText(message);
+          setPendingFor(session.id, null);
+          clearStreamingFor(session.id);
+          setErrorFor(session.id, message);
         },
       });
     },
-    [activeSession, loadSessions],
+    [loadSessions, setPendingFor, initStreamingFor, appendStreamingFor, clearStreamingFor, setErrorFor],
   );
 
   const runTurn = useCallback(
-    (content: string, kind: "message" | "ship30") => {
-      if (!activeSession) return;
-      setErrorText(null);
+    async (content: string, kind: "message" | "ship30") => {
+      // Lazy creation: activeSession is null both on a fresh "New chat" click
+      // and on first load with no sessions at all — either way, nothing gets
+      // created in the backend until there's actually a message to send.
+      let session = activeSession;
+      if (!session) {
+        setDraftErrorText(null);
+        try {
+          const created = await api.createSession(undefined, pseudoUserId());
+          session = { ...created, messages: [] };
+          setActiveSession(session);
+        } catch (err) {
+          setDraftErrorText(err instanceof ApiError ? err.message : "Could not start a new chat.");
+          return;
+        }
+      } else {
+        setErrorFor(session.id, null);
+      }
 
       // Optimistic user bubble so the UI feels responsive before the reply lands.
       const optimisticUser = {
@@ -198,20 +269,36 @@ export default function App() {
         citations: [],
         created_at: new Date().toISOString(),
       };
-      setActiveSession((prev) => (prev ? { ...prev, messages: [...prev.messages, optimisticUser] } : prev));
+      setActiveSession((prev) => (prev && prev.id === session!.id ? { ...prev, messages: [...prev.messages, optimisticUser] } : prev));
 
       // The backend names a session from its first message — refresh the
-      // sidebar list once (after the turn lands) so the new title shows up
+      // sidebar list once (after the turn lands) so the new title (and, for
+      // a lazily-created session, its very presence in the sidebar) shows up
       // without a manual reload.
-      const wasUntitled = activeSession.title === null;
+      const wasUntitled = session.title === null;
 
-      if (kind === "ship30") runShip30(content, wasUntitled);
-      else runMessage(content, wasUntitled);
+      if (kind === "ship30") await runShip30(session, content, wasUntitled);
+      else await runMessage(session, content, wasUntitled);
     },
-    [activeSession, runShip30, runMessage],
+    [activeSession, runShip30, runMessage, setErrorFor],
   );
 
+  const handleStop = useCallback(() => {
+    // Fire-and-forget: the stream's own onDone/onDelta handlers (already
+    // running) take care of clearing pending/streaming state and persisting
+    // whatever was generated so far once the backend wraps the turn up —
+    // nothing else to do here client-side.
+    if (activeSession) api.stopMessage(activeSession.id).catch(() => {});
+  }, [activeSession]);
+
   const degraded = health && health.status !== "ok";
+  const activePendingLabel = activeSession ? (pendingBySession[activeSession.id] ?? null) : null;
+  const activeStreamingText = activeSession ? (streamingBySession[activeSession.id] ?? null) : null;
+  const activeErrorText = activeSession ? (errorBySession[activeSession.id] ?? null) : draftErrorText;
+  // A chat with a generation in flight, wherever you're currently looking —
+  // lets the sidebar mark it so a background reply isn't invisible just
+  // because you navigated away from it.
+  const generatingSessionIds = new Set([...Object.keys(pendingBySession), ...Object.keys(streamingBySession)]);
 
   return (
     <div className="flex h-screen flex-col bg-slate-50 dark:bg-slate-950">
@@ -219,7 +306,7 @@ export default function App() {
         <div className="flex items-center gap-2">
           <button
             type="button"
-            className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 md:hidden"
+            className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-slate-400 dark:hover:bg-slate-800 md:hidden"
             onClick={() => setSidebarOpen((o) => !o)}
             aria-label="Toggle sessions"
           >
@@ -258,7 +345,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 overflow-hidden">
         {sidebarOpen && (
           <button
             type="button"
@@ -271,6 +358,7 @@ export default function App() {
           <SessionSidebar
             sessions={sessions}
             activeId={activeSession?.id ?? null}
+            generatingIds={generatingSessionIds}
             onSelect={openSession}
             onNew={handleNewSession}
             onDelete={handleDeleteSession}
@@ -280,22 +368,24 @@ export default function App() {
         <main className="flex min-w-0 flex-1 flex-col bg-slate-50 dark:bg-slate-950">
           <MessageList
             messages={activeSession?.messages ?? []}
-            pendingLabel={pendingLabel}
-            streamingText={streamingText}
-            errorText={errorText}
+            pendingLabel={activePendingLabel}
+            streamingText={activeStreamingText}
+            errorText={activeErrorText}
             onSuggestion={(text) => runTurn(text, "message")}
+            onOpenArtifact={setArtifact}
           />
           <MessageInput
-            disabled={!activeSession || !!pendingLabel || streamingText !== null}
+            disabled={!!activePendingLabel || activeStreamingText !== null}
             value={draft}
             onValueChange={setDraft}
             onSend={(text) => runTurn(text, "message")}
             onShip30={(text) => runTurn(text, "ship30")}
+            onStop={handleStop}
           />
         </main>
 
         {artifact && (
-          <div className="fixed inset-0 z-20 md:static md:inset-auto">
+          <div className="fixed inset-0 z-20 flex flex-col bg-white animate-fade-in dark:bg-slate-900 md:static md:inset-auto md:flex-none md:w-[44%] md:bg-transparent dark:md:bg-transparent">
             <ArtifactViewer artifact={artifact} onClose={() => setArtifact(null)} />
           </div>
         )}

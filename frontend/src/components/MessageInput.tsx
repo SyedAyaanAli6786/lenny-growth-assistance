@@ -6,11 +6,12 @@ interface Props {
   onValueChange: (value: string) => void;
   onSend: (text: string) => void;
   onShip30: (text: string) => void;
+  onStop: () => void;
 }
 
 const MAX_LENGTH = 8000;
 
-export function MessageInput({ disabled, value, onValueChange, onSend, onShip30 }: Props) {
+export function MessageInput({ disabled, value, onValueChange, onSend, onShip30, onStop }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [focused, setFocused] = useState(false);
 
@@ -67,7 +68,7 @@ export function MessageInput({ disabled, value, onValueChange, onSend, onShip30 
           disabled={disabled || !value.trim()}
           onClick={() => submit(onShip30)}
           title="Turn this into a Ship 30 for 30 essay"
-          className="flex shrink-0 items-center gap-1 rounded-xl border border-slate-300 px-2.5 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-50 disabled:opacity-40 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-700"
+          className="flex shrink-0 items-center gap-1 rounded-xl border border-slate-300 px-2.5 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 disabled:opacity-40 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-700"
         >
           <svg viewBox="0 0 16 16" fill="none" className="h-3.5 w-3.5" aria-hidden>
             <path
@@ -80,22 +81,36 @@ export function MessageInput({ disabled, value, onValueChange, onSend, onShip30 
           <span className="hidden sm:inline">Ship 30/30</span>
         </button>
 
-        <button
-          type="submit"
-          disabled={disabled || !value.trim()}
-          aria-label="Send message"
-          className="flex shrink-0 items-center justify-center rounded-xl bg-brand-600 p-2 text-white transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden>
-            <path
-              d="M10 16V4M10 4l-5 5M10 4l5 5"
-              stroke="currentColor"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </button>
+        {disabled ? (
+          <button
+            type="button"
+            onClick={onStop}
+            aria-label="Stop generating"
+            title="Stop generating"
+            className="flex shrink-0 items-center justify-center rounded-xl bg-slate-700 p-2 text-white transition-colors hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-1 dark:bg-slate-600 dark:hover:bg-slate-500"
+          >
+            <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden>
+              <rect x="5" y="5" width="10" height="10" rx="1.5" fill="currentColor" />
+            </svg>
+          </button>
+        ) : (
+          <button
+            type="submit"
+            disabled={!value.trim()}
+            aria-label="Send message"
+            className="flex shrink-0 items-center justify-center rounded-xl bg-brand-600 p-2 text-white transition-colors hover:bg-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden>
+              <path
+                d="M10 16V4M10 4l-5 5M10 4l5 5"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
+        )}
       </div>
       <div className="mx-auto mt-1.5 flex max-w-2xl items-center justify-between px-1 text-[11px] text-slate-400 dark:text-slate-500">
         <span>Enter to send · Shift+Enter for a new line</span>

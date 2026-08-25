@@ -68,7 +68,7 @@ export function ArtifactViewer({ artifact, onClose }: { artifact: ArtifactData; 
 
   return (
     <aside
-      className="flex h-full w-full flex-col border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 md:w-[44%]"
+      className="flex h-full min-h-0 w-full flex-col border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900"
       aria-label="Artifact viewer"
     >
       <div className="flex items-center justify-between gap-2 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
@@ -87,7 +87,7 @@ export function ArtifactViewer({ artifact, onClose }: { artifact: ArtifactData; 
         <button
           type="button"
           onClick={onClose}
-          className="shrink-0 rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+          className="shrink-0 rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
           aria-label="Close artifact viewer"
         >
           <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden>
@@ -103,7 +103,7 @@ export function ArtifactViewer({ artifact, onClose }: { artifact: ArtifactData; 
               key={t}
               type="button"
               onClick={() => setTab(t)}
-              className={`rounded-t-lg px-3 py-1.5 text-xs font-medium capitalize transition-colors ${
+              className={`rounded-t-lg px-3 py-1.5 text-xs font-medium capitalize transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 ${
                 tab === t
                   ? "bg-slate-100 text-slate-900 dark:bg-slate-800 dark:text-slate-100"
                   : "text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
@@ -118,14 +118,14 @@ export function ArtifactViewer({ artifact, onClose }: { artifact: ArtifactData; 
           <button
             type="button"
             onClick={copySource}
-            className="rounded-lg px-2 py-1 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            className="rounded-lg px-2 py-1 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
           >
             {copied ? "Copied" : "Copy"}
           </button>
           <button
             type="button"
             onClick={downloadSource}
-            className="rounded-lg px-2 py-1 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            className="rounded-lg px-2 py-1 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
           >
             Download
           </button>

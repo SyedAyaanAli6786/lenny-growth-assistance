@@ -129,6 +129,8 @@ export const api = {
 
   streamMessage,
 
+  stopMessage: (sessionId: string) => request<void>(`/api/sessions/${sessionId}/messages/stop`, { method: "POST" }),
+
   generateShip30: (sessionId: string, content: string) =>
     request<ChatTurnResponse>(`/api/sessions/${sessionId}/ship30`, {
       method: "POST",

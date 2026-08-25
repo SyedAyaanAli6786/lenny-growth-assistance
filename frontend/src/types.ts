@@ -23,6 +23,7 @@ export interface MessageData {
   provider: string | null;
   citations: Citation[];
   created_at: string;
+  artifact?: ArtifactData | null;
 }
 
 export interface SessionSummary {

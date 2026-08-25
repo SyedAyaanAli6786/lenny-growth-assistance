@@ -20,6 +20,7 @@ export function CitationList({ citations }: { citations: Citation[] }) {
         onClick={() => setOpen((o) => !o)}
         className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-300 dark:hover:bg-slate-800"
         aria-expanded={open}
+        aria-label={`${open ? "Hide" : "Show"} ${citations.length} source${citations.length === 1 ? "" : "s"}`}
       >
         <svg viewBox="0 0 16 16" fill="none" className="h-3 w-3" aria-hidden>
           <path

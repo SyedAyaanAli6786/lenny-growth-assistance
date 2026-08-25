@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { renderMarkdown } from "../lib/markdown";
-import type { MessageData } from "../types";
+import type { ArtifactData, MessageData } from "../types";
 import { CitationList } from "./CitationList";
 
 interface Props {
@@ -10,6 +10,7 @@ interface Props {
   streamingText: string | null;
   errorText: string | null;
   onSuggestion: (text: string) => void;
+  onOpenArtifact: (artifact: ArtifactData) => void;
 }
 
 const ASSISTANT_BUBBLE_CLASS =
@@ -93,12 +94,39 @@ function TypingIndicator({ label }: { label: string }) {
   );
 }
 
-export function MessageList({ messages, pendingLabel, streamingText, errorText, onSuggestion }: Props) {
+export function MessageList({ messages, pendingLabel, streamingText, errorText, onSuggestion, onOpenArtifact }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Whether the user is (still) at the bottom of the scroll area — read on
+  // every scroll event, not just once, so scrolling away mid-stream is
+  // noticed immediately rather than only at the next render.
+  const isNearBottomRef = useRef(true);
 
+  const handleScroll = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  };
+
+  // A new message (the user's own send, or a reply that just finished)
+  // always snaps to the bottom — that's an explicit action or a turn
+  // completing, not something to fight the user's scroll position over.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, pendingLabel, streamingText, errorText]);
+    isNearBottomRef.current = true;
+  }, [messages.length]);
+
+  // Token-by-token streaming growth, by contrast, only follows the bottom if
+  // the user hasn't scrolled away to read something else. Previously this
+  // ran unconditionally on every delta, which yanked the view back down on
+  // every token and made it impossible to scroll up while a reply streamed
+  // in. "auto" (instant), not "smooth" — a smooth scroll re-triggered many
+  // times a second just fights itself.
+  useEffect(() => {
+    if (isNearBottomRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    }
+  }, [streamingText, pendingLabel, errorText]);
 
   if (messages.length === 0 && !pendingLabel && !streamingText && !errorText) {
     return (
@@ -128,7 +156,14 @@ export function MessageList({ messages, pendingLabel, streamingText, errorText, 
   }
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-4" aria-live="polite" role="log">
+    <div
+      ref={containerRef}
+      onScroll={handleScroll}
+      className="flex-1 overflow-y-auto px-4 py-4"
+      aria-live="polite"
+      aria-atomic="false"
+      role="log"
+    >
       <ul className="mx-auto flex max-w-2xl flex-col gap-5">
         {messages.map((m) => {
           const isUser = m.role === "user";
@@ -140,8 +175,23 @@ export function MessageList({ messages, pendingLabel, streamingText, errorText, 
                   <div className="whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-brand-600 px-4 py-2.5 text-sm text-white shadow-sm">
                     {m.content}
                   </div>
-                ) : (
+                ) : m.artifact ? (
+                  <button
+                    type="button"
+                    onClick={() => onOpenArtifact(m.artifact!)}
+                    title="Reopen artifact"
+                    className={`${ASSISTANT_BUBBLE_CLASS} cursor-pointer text-left transition-colors hover:ring-brand-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:hover:ring-brand-700`}
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }}
+                  />
+                ) : m.content.trim() ? (
                   <div className={ASSISTANT_BUBBLE_CLASS} dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} />
+                ) : (
+                  // Generation can be stopped before the model produced any
+                  // token at all — an empty bubble here would look broken
+                  // rather than intentional.
+                  <div className={`${ASSISTANT_BUBBLE_CLASS} italic text-slate-400 dark:text-slate-500`}>
+                    Stopped before any response was generated.
+                  </div>
                 )}
 
                 <div
@@ -168,7 +218,7 @@ export function MessageList({ messages, pendingLabel, streamingText, errorText, 
         )}
 
         {streamingText !== null && (
-          <li className="flex items-start gap-2.5">
+          <li className="flex items-start gap-2.5 animate-fade-in">
             <AssistantAvatar />
             <div className="flex min-w-0 max-w-[85%] flex-col items-start">
               <div className={ASSISTANT_BUBBLE_CLASS} dangerouslySetInnerHTML={{ __html: renderMarkdown(streamingText) }} />
@@ -177,8 +227,8 @@ export function MessageList({ messages, pendingLabel, streamingText, errorText, 
         )}
 
         {errorText && (
-          <li className="flex items-start gap-2.5" role="alert">
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-rose-100 text-rose-600 dark:bg-rose-950/60 dark:text-rose-400">
+          <li className="flex items-start gap-2.5 animate-fade-in" role="alert">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-rose-100 font-semibold text-rose-600 dark:bg-rose-900/60 dark:text-rose-300">
               !
             </div>
             <div className="max-w-[85%] rounded-2xl rounded-tl-sm border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300">
