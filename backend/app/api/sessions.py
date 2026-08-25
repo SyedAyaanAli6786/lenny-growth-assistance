@@ -9,7 +9,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
 from app.agent.base import ChatMessage, ProviderTimeoutError, ProviderUnavailableError
-from app.agent.orchestrator import StreamDelta, StreamDone, get_provider, respond, respond_stream, run_ship30
+from app.agent.orchestrator import (
+    StreamDelta,
+    StreamDone,
+    StreamRestart,
+    get_provider,
+    respond,
+    respond_stream,
+    run_ship30_stream,
+)
 from app.api.schemas import (
     ArtifactOut,
     ChatTurnResponse,
@@ -345,14 +353,74 @@ async def stop_message_stream(session_id: UUID) -> None:
         stop_event.set()
 
 
-@router.post("/{session_id}/ship30", response_model=ChatTurnResponse)
-async def ship30(session_id: UUID, payload: MessageCreate, db: AsyncSession = Depends(get_db)) -> ChatTurnResponse:
-    session = await _get_session_or_404(db, session_id)
-    if session.title is None:
-        session.title = _derive_title(payload.content)
+@router.post("/{session_id}/ship30/stream")
+async def ship30_stream(session_id: UUID, payload: MessageCreate, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
+    """Streaming counterpart to what used to be a plain POST /ship30: same
+    NDJSON framing as /messages/stream, plus one extra event type —
+    {"type": "restart"} — emitted if the draft fails validation and a repair
+    pass is starting, telling the frontend to clear the in-progress bubble
+    rather than appending the repair's text after the discarded draft's.
 
-    await _persist_user_message(db, session, f"[Ship 30/30] {payload.content}")
-    result = await run_ship30(db, session.llm_provider, ChatMessage(role="user", content=payload.content))
-    assistant_message, artifact_row = await _persist_assistant_message(db, session, result)
+    Replaces the non-streaming version outright rather than keeping both:
+    a full Ship 30 essay plus a possible repair pass measured 200-400+s on
+    CPU-only hardware, and confirmed live, something in the stack (proxy,
+    browser, or OS idle-timeout) will drop a connection sitting that idle —
+    the reply still persisted correctly since non-streaming requests aren't
+    cancelled on disconnect, but the user's tab had no way to know that. See
+    run_ship30_stream()'s docstring for the full account.
+    """
+    # Registered synchronously, before any awaits below — see the matching
+    # comment in send_message_stream for why (closes a real, if narrow, race
+    # where a stop request could arrive before this session_id is in the
+    # registry and silently no-op).
+    stop_event = asyncio.Event()
+    _active_streams[session_id] = stop_event
 
-    return _build_turn_response(assistant_message, artifact_row)
+    try:
+        session = await _get_session_or_404(db, session_id)
+        provider_name = session.llm_provider
+    except Exception:
+        _active_streams.pop(session_id, None)
+        raise
+
+    async def event_stream():
+        try:
+            async with async_session_factory() as stream_db:
+                stream_session = await stream_db.get(SessionModel, session_id)
+                if stream_session is None:
+                    yield json.dumps({"type": "error", "code": "session_not_found", "message": f"No session {session_id}"}) + "\n"
+                    return
+                if stream_session.title is None:
+                    stream_session.title = _derive_title(payload.content)
+
+                try:
+                    await _persist_user_message(stream_db, stream_session, f"[Ship 30/30] {payload.content}")
+
+                    topic_message = ChatMessage(role="user", content=payload.content)
+                    async for event in run_ship30_stream(stream_db, provider_name, topic_message, stop_event=stop_event):
+                        if isinstance(event, StreamDelta):
+                            yield json.dumps({"type": "delta", "text": event.text}) + "\n"
+                        elif isinstance(event, StreamRestart):
+                            yield json.dumps({"type": "restart"}) + "\n"
+                        elif isinstance(event, StreamDone):
+                            assistant_message, artifact_row = await _persist_assistant_message(
+                                stream_db, stream_session, event.result
+                            )
+                            turn = _build_turn_response(assistant_message, artifact_row)
+                            yield json.dumps({"type": "done", "turn": turn.model_dump(mode="json")}) + "\n"
+                except ProviderUnavailableError as exc:
+                    logger.error("ship30_stream_provider_unavailable", error=str(exc))
+                    yield json.dumps({"type": "error", "code": "provider_unavailable", "message": str(exc)}) + "\n"
+                except ProviderTimeoutError as exc:
+                    logger.error("ship30_stream_provider_timeout", error=str(exc))
+                    yield json.dumps({"type": "error", "code": "provider_timeout", "message": str(exc)}) + "\n"
+                except EmbeddingError as exc:
+                    logger.error("ship30_stream_embedding_error", error=str(exc))
+                    yield json.dumps({"type": "error", "code": "embedding_unavailable", "message": str(exc)}) + "\n"
+                except Exception as exc:
+                    logger.error("ship30_stream_unhandled_exception", error=str(exc), exc_info=True)
+                    yield json.dumps({"type": "error", "code": "internal_error", "message": "An unexpected error occurred"}) + "\n"
+        finally:
+            _active_streams.pop(session_id, None)
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")

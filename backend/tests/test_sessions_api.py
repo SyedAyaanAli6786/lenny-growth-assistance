@@ -396,14 +396,78 @@ async def test_provider_switch_rejects_unavailable_provider(client, patch_provid
     assert resp.json()["detail"]["error"]["code"] == "provider_unavailable"
 
 
-async def test_ship30_endpoint_returns_markdown_artifact(client, patch_providers):
-    essay = "```markdown\n# Ship 30 Essay\n\n**Bold point.**\n\nTakeaway: start by doing it.\n```"
+async def test_ship30_stream_returns_markdown_artifact(client, patch_providers):
+    filler = " ".join(f"word{i}" for i in range(1240))
+    essay = f"```markdown\n# Ship 30 Essay\n\n## A Heading\n\n**Bold point.** {filler}\n\nTakeaway: start by doing it.\n```"
     patch_providers["ollama"]._reply = essay
 
     session = (await client.post("/api/sessions", json={})).json()
-    resp = await client.post(f"/api/sessions/{session['id']}/ship30", json={"content": "activation"})
+    async with client.stream(
+        "POST", f"/api/sessions/{session['id']}/ship30/stream", json={"content": "activation"}
+    ) as resp:
+        assert resp.status_code == 200
+        events = await _read_ndjson(resp)
 
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["artifact"]["type"] == "markdown"
-    assert body["artifact"]["title"] == "Ship 30 Essay"
+    assert not any(e["type"] == "restart" for e in events)  # a passing draft needs no repair
+    done = next(e for e in events if e["type"] == "done")
+    assert done["turn"]["artifact"]["type"] == "markdown"
+    assert done["turn"]["artifact"]["title"] == "Ship 30 Essay"
+    # First user message is prefixed and persisted before generation, same as
+    # the old non-streaming endpoint did.
+    detail = (await client.get(f"/api/sessions/{session['id']}")).json()
+    assert detail["messages"][0]["content"] == "[Ship 30/30] activation"
+
+
+async def test_ship30_stream_emits_restart_event_when_draft_needs_repair(client, patch_providers):
+    # First generate_stream() call returns a draft short enough to fail
+    # validation; the second (the repair pass) returns a passing one. A
+    # {"type": "restart"} event must appear between them so the frontend
+    # knows to discard the failed draft's text instead of appending the
+    # repair's after it.
+    calls = {"n": 0}
+
+    async def two_pass_stream(system_prompt, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield "```markdown\n# Too short\n```"
+        else:
+            words = " ".join(f"word{i}" for i in range(1300))
+            yield f"```markdown\n# Fixed Essay\n\n**Bold.**\n\n{words}\n\nTakeaway: ship it.\n```"
+
+    patch_providers["ollama"].generate_stream = two_pass_stream
+    session = (await client.post("/api/sessions", json={})).json()
+
+    async with client.stream(
+        "POST", f"/api/sessions/{session['id']}/ship30/stream", json={"content": "activation"}
+    ) as resp:
+        events = await _read_ndjson(resp)
+
+    assert calls["n"] == 2
+    restart_index = next(i for i, e in enumerate(events) if e["type"] == "restart")
+    # Deltas before the restart belong to the discarded draft; deltas after
+    # belong to the repair. The final artifact must only reflect the repair.
+    done = next(e for e in events if e["type"] == "done")
+    assert done["turn"]["artifact"]["title"] == "Fixed Essay"
+    assert "Too short" not in done["turn"]["message"]["content"]
+    assert restart_index < len(events) - 1
+
+
+async def test_ship30_stream_persists_user_message_even_if_generation_fails(client, patch_providers):
+    async def failing_stream(system_prompt, messages):
+        yield "Partial "
+        raise RuntimeError("simulated mid-stream failure")
+
+    patch_providers["ollama"].generate_stream = failing_stream
+    session = (await client.post("/api/sessions", json={})).json()
+
+    async with client.stream(
+        "POST", f"/api/sessions/{session['id']}/ship30/stream", json={"content": "activation"}
+    ) as resp:
+        events = await _read_ndjson(resp)
+
+    assert any(e["type"] == "error" for e in events)
+    assert not any(e["type"] == "done" for e in events)
+
+    detail = (await client.get(f"/api/sessions/{session['id']}")).json()
+    assert [m["role"] for m in detail["messages"]] == ["user"]
+    assert detail["messages"][0]["content"] == "[Ship 30/30] activation"

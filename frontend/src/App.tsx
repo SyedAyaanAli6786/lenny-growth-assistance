@@ -194,23 +194,35 @@ export default function App() {
   const runShip30 = useCallback(
     async (session: SessionDetail, content: string, wasUntitled: boolean) => {
       setPendingFor(session.id, `Drafting Ship 30 essay… (${session.llm_provider})`);
-      try {
-        const turn = await api.generateShip30(session.id, content);
-        setActiveSession((prev) => (prev && prev.id === session.id ? { ...prev, messages: [...prev.messages, turn.message] } : prev));
-        if (turn.artifact) setArtifact(turn.artifact);
-        if (wasUntitled) loadSessions();
-      } catch (err) {
-        setErrorFor(
-          session.id,
-          err instanceof ApiError
-            ? `${err.message}${err.component ? ` (${err.component})` : ""}`
-            : "Something went wrong talking to the backend.",
-        );
-      } finally {
-        setPendingFor(session.id, null);
-      }
+      initStreamingFor(session.id);
+
+      await api.streamShip30(session.id, content, {
+        onDelta: (text) => {
+          setPendingFor(session.id, null);
+          appendStreamingFor(session.id, text);
+        },
+        onRestart: () => {
+          // The draft just failed validation and a repair pass is starting —
+          // discard the failed draft's text instead of appending the
+          // repair's deltas after it.
+          setPendingFor(session.id, `Drafting Ship 30 essay… (${session.llm_provider})`);
+          initStreamingFor(session.id);
+        },
+        onDone: (turn) => {
+          setPendingFor(session.id, null);
+          clearStreamingFor(session.id);
+          setActiveSession((prev) => (prev && prev.id === session.id ? { ...prev, messages: [...prev.messages, turn.message] } : prev));
+          if (turn.artifact) setArtifact(turn.artifact);
+          if (wasUntitled) loadSessions();
+        },
+        onError: (message) => {
+          setPendingFor(session.id, null);
+          clearStreamingFor(session.id);
+          setErrorFor(session.id, message);
+        },
+      });
     },
-    [loadSessions, setPendingFor, setErrorFor],
+    [loadSessions, setPendingFor, initStreamingFor, appendStreamingFor, clearStreamingFor, setErrorFor],
   );
 
   const runMessage = useCallback(

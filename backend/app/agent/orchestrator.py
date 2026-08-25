@@ -83,6 +83,14 @@ class StreamDone:
     result: OrchestrationResult
 
 
+@dataclass(frozen=True)
+class StreamRestart:
+    """Only emitted by run_ship30_stream(): a failed draft is about to be
+    regenerated via the repair prompt. Tells the caller to clear whatever
+    text it's displayed so far, rather than appending the repair pass's
+    deltas after the discarded draft's."""
+
+
 def _citations_from_text(text: str, retrieved: list[RetrievedChunk]) -> list[dict]:
     if not text.strip():
         # No text means nothing was actually attributed to anything — most
@@ -192,6 +200,7 @@ async def _stoppable(agen, stop_event: asyncio.Event | None):
         return
 
     stop_task = asyncio.ensure_future(stop_event.wait())
+    next_task: asyncio.Task | None = None
     try:
         while True:
             next_task = asyncio.ensure_future(agen.__anext__())
@@ -202,12 +211,29 @@ async def _stoppable(agen, stop_event: asyncio.Event | None):
                     await next_task
                 except (asyncio.CancelledError, StopAsyncIteration):
                     pass
+                next_task = None
                 break
             try:
                 yield next_task.result()
             except StopAsyncIteration:
+                next_task = None
                 break
     finally:
+        # If we get here via an exception (e.g. the *consumer* of this
+        # generator was itself cancelled — Starlette cancels a
+        # StreamingResponse's task when it detects the client disconnected),
+        # next_task can still be in flight against `agen`. Leaving it running
+        # means agen.aclose() (called by our own caller's finally, right
+        # after this one) fails with "aclose(): asynchronous generator is
+        # already running" — which used to abort the whole generation on any
+        # real disconnect, defeating the entire point of streaming this so
+        # persistence survives a dropped connection.
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
+            try:
+                await next_task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
         if not stop_task.done():
             stop_task.cancel()
             try:
@@ -278,9 +304,51 @@ async def respond_stream(
     yield StreamDone(_finalize(full_text, provider_name, provider.model_name, retrieved))
 
 
-async def run_ship30(db: AsyncSession, provider_name: str, topic_message: ChatMessage) -> OrchestrationResult:
-    """Retrieve grounding for the topic, draft via the Ship 30 skill, validate,
-    and do one automatic repair pass if the draft violates the format rules.
+async def _generate_streamed(
+    provider: LLMProvider,
+    system_prompt: str,
+    messages: list[ChatMessage],
+    stop_event: asyncio.Event | None,
+    collected: list[str],
+) -> AsyncIterator[str]:
+    """Stream one provider.generate_stream() call, appending each piece to
+    `collected` as it arrives. `collected` is an out-parameter rather than a
+    return value because async generators can't `return` one (a SyntaxError)
+    — the caller reads the accumulated text from it once this is exhausted.
+    Used twice by run_ship30_stream(): once for the initial draft, once for
+    the repair pass if the draft fails validation.
+    """
+    agen = provider.generate_stream(system_prompt, messages)
+    try:
+        async for piece in _stoppable(agen, stop_event):
+            collected.append(piece)
+            yield piece
+    finally:
+        await agen.aclose()
+
+
+async def run_ship30_stream(
+    db: AsyncSession,
+    provider_name: str,
+    topic_message: ChatMessage,
+    stop_event: asyncio.Event | None = None,
+) -> AsyncIterator[StreamDelta | StreamRestart | StreamDone]:
+    """Streaming counterpart to what used to be run_ship30(): same
+    retrieve -> draft -> validate -> (repair once if needed) -> finalize
+    flow, but the caller sees each text chunk as soon as the provider
+    produces it, the same way respond_stream() works for regular chat.
+
+    This isn't just consistency with the chat endpoint — it's the actual fix
+    for a real bug: a full Ship 30 essay plus a possible repair pass can run
+    200-400+s on this CPU-only setup, and a single non-streamed response
+    sitting completely idle that long is exactly the shape of request a
+    proxy, browser, or OS idle-timeout is liable to drop. Confirmed live: a
+    real essay-generation request's connection was dropped by something in
+    the stack well before the ~45-minute (repair pass included, under heavy
+    system load) generation finished — the reply still persisted correctly
+    since non-streaming requests aren't cancelled on disconnect, but the
+    user's own tab had no way to know that and showed nothing. Streaming
+    keeps the connection actively sending data the whole time instead.
     """
     retrieved = await retrieve(db, topic_message.content)
 
@@ -292,25 +360,42 @@ async def run_ship30(db: AsyncSession, provider_name: str, topic_message: ChatMe
             "I don't have transcript material on this topic to draft a grounded Ship 30 "
             "essay from — try a product/growth topic covered in the knowledge base."
         )
-        return OrchestrationResult(
-            response=ProviderResponse(text=decline_text, provider=provider_name, model="n/a (no model call made)"),
-            citations=[],
-            artifact=None,
-            display_text=decline_text,
+        yield StreamDelta(decline_text)
+        yield StreamDone(
+            OrchestrationResult(
+                response=ProviderResponse(text=decline_text, provider=provider_name, model="n/a (no model call made)"),
+                citations=[],
+                artifact=None,
+                display_text=decline_text,
+            )
         )
+        return
 
     system_prompt = build_ship30_prompt(_format_sources(retrieved))
-
     provider = get_provider(provider_name)
-    draft = await provider.generate(system_prompt, [topic_message])
 
-    result = validate_ship30_draft(draft.text)
-    if not result.ok:
+    draft_chunks: list[str] = []
+    async for piece in _generate_streamed(provider, system_prompt, [topic_message], stop_event, draft_chunks):
+        yield StreamDelta(piece)
+    draft_text = "".join(draft_chunks).strip()
+    model_name = provider.model_name
+
+    result = validate_ship30_draft(draft_text)
+    if not result.ok and not (stop_event is not None and stop_event.is_set()):
+        # If stop was already requested, the draft's failing validation is
+        # just a side effect of being cut short — starting a repair pass now
+        # would fire an extra provider call and a spurious "restart" event
+        # for a generation the user already asked to end.
         logger.warning("ship30_validation_failed", issues=result.issues, word_count=result.word_count)
-        repair_prompt = build_repair_prompt(draft.text, result.issues)
-        draft = await provider.generate(system_prompt, [ChatMessage(role="user", content=repair_prompt)])
-        result = validate_ship30_draft(draft.text)
+        yield StreamRestart()
+        repair_prompt = build_repair_prompt(draft_text, result.issues)
+        repair_messages = [ChatMessage(role="user", content=repair_prompt)]
+        repair_chunks: list[str] = []
+        async for piece in _generate_streamed(provider, system_prompt, repair_messages, stop_event, repair_chunks):
+            yield StreamDelta(piece)
+        draft_text = "".join(repair_chunks).strip()
+        result = validate_ship30_draft(draft_text)
         if not result.ok:
             logger.warning("ship30_repair_still_failing", issues=result.issues, word_count=result.word_count)
 
-    return _finalize(draft.text, provider_name, draft.model, retrieved)
+    yield StreamDone(_finalize(draft_text, provider_name, model_name, retrieved))
