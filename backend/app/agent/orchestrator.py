@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -83,6 +84,13 @@ class StreamDone:
 
 
 def _citations_from_text(text: str, retrieved: list[RetrievedChunk]) -> list[dict]:
+    if not text.strip():
+        # No text means nothing was actually attributed to anything — most
+        # commonly a reply stopped (see the stop_event in respond_stream())
+        # before the model produced its first token. Without this check,
+        # the "model didn't use [S1]-style tags" fallback below would
+        # attach every retrieved chunk as if a citation to a blank message.
+        return []
     used_tags = {f"[S{i}]" for i in range(1, len(retrieved) + 1) if f"[S{i}]" in text}
     return [
         {
@@ -163,11 +171,57 @@ async def respond(
     return _finalize(provider_response.text, provider_name, provider_response.model, retrieved)
 
 
+async def _stoppable(agen, stop_event: asyncio.Event | None):
+    """Yield from agen, but interruptible by stop_event even while agen is
+    still waiting on its very next item — not just between items that have
+    already arrived.
+
+    A plain "check the flag after each yield" loop can't do this: nothing
+    re-checks the flag until the provider actually produces something, and
+    for Ollama specifically, "still thinking, no token yet" can last many
+    seconds — a stop click during that window would silently do nothing
+    until (if ever) a token showed up. Races the pending anext() against the
+    stop signal instead, and — critically — only ever cancels anext() when
+    stop actually fires, never on a timeout/poll: cancelling a suspended
+    async-generator frame closes it for good, so a generator can't be safely
+    "polled and resumed" by repeatedly cancelling and retrying.
+    """
+    if stop_event is None:
+        async for item in agen:
+            yield item
+        return
+
+    stop_task = asyncio.ensure_future(stop_event.wait())
+    try:
+        while True:
+            next_task = asyncio.ensure_future(agen.__anext__())
+            done, _pending = await asyncio.wait({next_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            if stop_task in done:
+                next_task.cancel()
+                try:
+                    await next_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+                break
+            try:
+                yield next_task.result()
+            except StopAsyncIteration:
+                break
+    finally:
+        if not stop_task.done():
+            stop_task.cancel()
+            try:
+                await stop_task
+            except asyncio.CancelledError:
+                pass
+
+
 async def respond_stream(
     db: AsyncSession,
     provider_name: str,
     history: list[ChatMessage],
     system_prompt_override: str | None = None,
+    stop_event: asyncio.Event | None = None,
 ) -> AsyncIterator[StreamDelta | StreamDone]:
     """Streaming counterpart to respond(): same retrieve-then-generate
     behavior and the same final OrchestrationResult shape, but the caller
@@ -175,6 +229,18 @@ async def respond_stream(
     waiting for the whole reply. Citations/artifact detection still need the
     complete text, so those are only computed once, in the terminal
     StreamDone event.
+
+    stop_event lets a user-initiated "stop generating" request end this early
+    without any special-casing at the persistence layer: breaking out of the
+    loop below (see _stoppable) still falls through to the same
+    _finalize()/StreamDone as a natural completion, so a stopped reply is
+    persisted exactly like a finished one, just shorter. This whole
+    endpoint's request/task is deliberately never cancelled to achieve that —
+    only the single pending "get the next token" wait inside _stoppable ever
+    is, and only once stop is actually requested. Cancelling the outer
+    request would mean performing the async DB persistence from inside an
+    exception handler on an already-cancelled task, a real asyncio footgun
+    (a second cancellation can land mid-cleanup); this design never needs to.
     """
     retrieved = await retrieve(db, _build_retrieval_query(history))
 
@@ -196,9 +262,17 @@ async def respond_stream(
     provider = get_provider(provider_name)
 
     chunks: list[str] = []
-    async for piece in provider.generate_stream(system_prompt, history):
-        chunks.append(piece)
-        yield StreamDelta(piece)
+    agen = provider.generate_stream(system_prompt, history)
+    try:
+        async for piece in _stoppable(agen, stop_event):
+            chunks.append(piece)
+            yield StreamDelta(piece)
+    finally:
+        # Always close the provider's own generator explicitly (rather than
+        # relying on GC to eventually do it via reference counting) so the
+        # underlying HTTP stream to Ollama/Anthropic is torn down promptly
+        # whether we finished, stopped early, or an error propagated through.
+        await agen.aclose()
 
     full_text = "".join(chunks).strip()
     yield StreamDone(_finalize(full_text, provider_name, provider.model_name, retrieved))

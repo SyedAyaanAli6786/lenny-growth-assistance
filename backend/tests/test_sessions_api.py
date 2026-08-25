@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -168,6 +169,115 @@ async def test_send_message_stream_persists_user_message_even_if_generation_fail
     assert [m["role"] for m in detail["messages"]] == ["user"]
 
 
+async def test_stop_endpoint_ends_stream_early_and_persists_the_partial_reply(client, patch_providers):
+    # A "stop generating" click should behave exactly like a natural
+    # completion, just shorter — persisted the same way, no special error
+    # path — rather than an abrupt cancellation. The provider here pauses
+    # indefinitely right after its first chunk (simulating Ollama still
+    # "thinking" with no token produced yet) so this test can verify the
+    # harder case: stop must interrupt that wait itself, not just a check
+    # between already-arrived chunks — a real bug in an earlier version of
+    # this feature, reported live as "the stop button doesn't do anything
+    # while it still says 'is thinking...'". If stop only took effect between
+    # yields, "world " below would still be produced after resume_after_stop
+    # is set; the fix means it must never appear.
+    reached_first_chunk = asyncio.Event()
+    resume_after_stop = asyncio.Event()
+
+    async def controlled_stream(system_prompt, messages):
+        yield "Hello "
+        reached_first_chunk.set()
+        await resume_after_stop.wait()
+        yield "world "
+        yield "text that must never be produced"
+
+    patch_providers["ollama"].generate_stream = controlled_stream
+    session = (await client.post("/api/sessions", json={})).json()
+
+    async def run_stream():
+        events = []
+        async with client.stream(
+            "POST", f"/api/sessions/{session['id']}/messages/stream", json={"content": "hi"}
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line:
+                    events.append(json.loads(line))
+        return events
+
+    task = asyncio.create_task(run_stream())
+    await asyncio.wait_for(reached_first_chunk.wait(), timeout=5)
+
+    stop_resp = await client.post(f"/api/sessions/{session['id']}/messages/stop")
+    assert stop_resp.status_code == 204
+
+    events = await asyncio.wait_for(task, timeout=5)
+    resume_after_stop.set()  # only to unblock controlled_stream's own cleanup, if it's even still running
+
+    deltas = "".join(e["text"] for e in events if e["type"] == "delta")
+    assert deltas == "Hello "
+    assert "world" not in deltas
+    assert "must never be produced" not in deltas
+
+    done = next(e for e in events if e["type"] == "done")
+    assert done["turn"]["message"]["content"] == "Hello"
+
+    # Persisted exactly like a normal completion — survives a fresh fetch.
+    detail = (await client.get(f"/api/sessions/{session['id']}")).json()
+    assert [m["role"] for m in detail["messages"]] == ["user", "assistant"]
+    assert detail["messages"][-1]["content"] == "Hello"
+
+
+async def test_stop_before_any_token_persists_an_empty_reply_with_no_citations(client, patch_providers):
+    # Reported live: clicking stop while still on "Ollama is thinking..." (no
+    # token produced yet at all) must interrupt that wait too, not just a
+    # pause between already-arrived tokens (see the test above). Also
+    # exercises a real edge case that surfaced only once that worked: an
+    # empty reply must not carry citations for sources it never actually
+    # used — _citations_from_text's "model didn't use [S1] tags" fallback
+    # would otherwise attach every retrieved chunk to a blank message.
+    never_yields = asyncio.Event()
+
+    async def stalls_forever(system_prompt, messages):
+        await never_yields.wait()
+        yield "unreachable"  # pragma: no cover
+
+    patch_providers["ollama"].generate_stream = stalls_forever
+    session = (await client.post("/api/sessions", json={})).json()
+
+    async def run_stream():
+        events = []
+        async with client.stream(
+            "POST", f"/api/sessions/{session['id']}/messages/stream", json={"content": "hi"}
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line:
+                    events.append(json.loads(line))
+        return events
+
+    task = asyncio.create_task(run_stream())
+    await asyncio.sleep(0.1)  # let the request reach the stalled provider call
+
+    stop_resp = await client.post(f"/api/sessions/{session['id']}/messages/stop")
+    assert stop_resp.status_code == 204
+
+    events = await asyncio.wait_for(task, timeout=5)
+
+    assert not any(e["type"] == "delta" for e in events)
+    done = next(e for e in events if e["type"] == "done")
+    assert done["turn"]["message"]["content"] == ""
+    assert done["turn"]["message"]["citations"] == []
+
+    detail = (await client.get(f"/api/sessions/{session['id']}")).json()
+    assert detail["messages"][-1]["content"] == ""
+    assert detail["messages"][-1]["citations"] == []
+
+
+async def test_stop_endpoint_is_a_no_op_when_nothing_is_generating(client):
+    session = (await client.post("/api/sessions", json={})).json()
+    resp = await client.post(f"/api/sessions/{session['id']}/messages/stop")
+    assert resp.status_code == 204
+
+
 async def test_send_message_stream_with_no_grounding_reports_decline_and_no_error(client, monkeypatch):
     async def empty_retrieve(db, query, top_k=None, min_score=None):
         return []
@@ -213,6 +323,29 @@ async def test_message_produces_artifact_when_reply_has_fenced_block(client, pat
     assert body["artifact"] is not None
     assert body["artifact"]["type"] == "markdown"
     assert body["artifact"]["title"] == "A Doc"
+    # The artifact is also embedded on the message itself, not just the
+    # top-level turn response — that's what lets a past turn's artifact be
+    # reopened later (see the next test).
+    assert body["message"]["artifact"] is not None
+    assert body["message"]["artifact"]["title"] == "A Doc"
+
+
+async def test_artifact_survives_a_fresh_fetch_after_the_turn_response_is_gone(client, patch_providers):
+    # Regression test: closing the artifact panel (or reloading, or switching
+    # sessions and back) used to lose the artifact forever, since MessageOut
+    # never carried it and GET /api/sessions/{id} had no way to recover it.
+    patch_providers["ollama"]._reply = "Here:\n\n```markdown\n# A Doc\n\nContent.\n```"
+    session = (await client.post("/api/sessions", json={})).json()
+    await client.post(f"/api/sessions/{session['id']}/messages", json={"content": "write a doc"})
+
+    detail = (await client.get(f"/api/sessions/{session['id']}")).json()
+    assistant_message = next(m for m in detail["messages"] if m["role"] == "assistant")
+    assert assistant_message["artifact"] is not None
+    assert assistant_message["artifact"]["title"] == "A Doc"
+
+    # A message with no artifact stays None, not a missing key or an error.
+    user_message = next(m for m in detail["messages"] if m["role"] == "user")
+    assert user_message["artifact"] is None
 
 
 async def test_first_message_names_an_untitled_session(client, patch_providers):

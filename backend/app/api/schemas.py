@@ -52,6 +52,10 @@ class MessageOut(BaseModel):
     provider: str | None = None
     citations: list[Citation] = Field(default_factory=list)
     created_at: datetime
+    # Only set for an assistant message that produced one — lets the frontend
+    # reopen the artifact panel for a past turn (after closing it, switching
+    # sessions, or reloading) instead of only ever seeing it once.
+    artifact: ArtifactOut | None = None
 
     @field_validator("citations", mode="before")
     @classmethod

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from uuid import UUID
 
@@ -29,6 +30,13 @@ from app.rag.embeddings import EmbeddingError
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 logger = get_logger(__name__)
+
+# In-memory only, one entry per session with a stream currently in flight —
+# fine at this app's single-process scale (same assumption as the rest of
+# the app's state), not durable across a restart. Lets POST .../stop signal
+# an in-progress generator without needing to cancel the request/task (see
+# respond_stream's docstring for why cooperative checking is used instead).
+_active_streams: dict[UUID, asyncio.Event] = {}
 
 
 def _default_model_for(provider: str) -> str:
@@ -82,6 +90,39 @@ async def _get_session_or_404(db: AsyncSession, session_id: UUID) -> SessionMode
     return session
 
 
+async def _messages_with_artifacts(db: AsyncSession, messages: list[Message]) -> list[MessageOut]:
+    """Attach each message's artifact (if it produced one), so a past turn's
+    artifact can be reopened after closing it, switching sessions, or
+    reloading — not just visible once from the immediate turn response.
+    """
+    message_ids = [m.id for m in messages]
+    artifact_rows = (
+        (await db.execute(select(ArtifactModel).where(ArtifactModel.message_id.in_(message_ids)))).scalars().all()
+        if message_ids
+        else []
+    )
+    artifacts_by_message = {a.message_id: a for a in artifact_rows}
+
+    out = []
+    for m in messages:
+        message_out = MessageOut.model_validate(m, from_attributes=True)
+        artifact_row = artifacts_by_message.get(m.id)
+        if artifact_row:
+            message_out = message_out.model_copy(
+                update={"artifact": ArtifactOut.model_validate(artifact_row, from_attributes=True)}
+            )
+        out.append(message_out)
+    return out
+
+
+def _build_turn_response(assistant_message: Message, artifact_row: ArtifactModel | None) -> ChatTurnResponse:
+    artifact_out = ArtifactOut.model_validate(artifact_row, from_attributes=True) if artifact_row else None
+    message_out = MessageOut.model_validate(assistant_message, from_attributes=True)
+    if artifact_out:
+        message_out = message_out.model_copy(update={"artifact": artifact_out})
+    return ChatTurnResponse(message=message_out, artifact=artifact_out)
+
+
 @router.get("/{session_id}", response_model=SessionDetail)
 async def get_session(session_id: UUID, db: AsyncSession = Depends(get_db)) -> SessionDetail:
     session = await _get_session_or_404(db, session_id)
@@ -89,7 +130,7 @@ async def get_session(session_id: UUID, db: AsyncSession = Depends(get_db)) -> S
     messages = (await db.execute(stmt)).scalars().all()
     return SessionDetail(
         **SessionSummary.model_validate(session, from_attributes=True).model_dump(),
-        messages=[MessageOut.model_validate(m, from_attributes=True) for m in messages],
+        messages=await _messages_with_artifacts(db, messages),
     )
 
 
@@ -183,10 +224,7 @@ async def send_message(session_id: UUID, payload: MessageCreate, db: AsyncSessio
     result = await respond(db, session.llm_provider, history)
     assistant_message, artifact_row = await _persist_assistant_message(db, session, result)
 
-    return ChatTurnResponse(
-        message=MessageOut.model_validate(assistant_message, from_attributes=True),
-        artifact=ArtifactOut.model_validate(artifact_row, from_attributes=True) if artifact_row else None,
-    )
+    return _build_turn_response(assistant_message, artifact_row)
 
 
 @router.post("/{session_id}/messages/stream")
@@ -217,11 +255,27 @@ async def send_message_stream(session_id: UUID, payload: MessageCreate, db: Asyn
     this, a disconnect mid-stream would silently lose the user's own message
     and leave the session untitled, with no trace it was ever sent.
     """
-    session = await _get_session_or_404(db, session_id)
-    provider_name = session.llm_provider
+    # Registered synchronously, before any awaits below, so there's no window
+    # where a client's POST .../stop could arrive before this session_id is
+    # in the registry and silently no-op — a real (if narrow) race when this
+    # was created later, inside event_stream(), after its own await on a DB
+    # lookup. A client physically can't call the stop endpoint before this
+    # request has even started sending its response, so registering first
+    # thing here closes the gap entirely rather than just narrowing it.
+    stop_event = asyncio.Event()
+    _active_streams[session_id] = stop_event
 
-    stmt = select(Message).where(Message.session_id == session_id).order_by(Message.created_at)
-    prior_messages = (await db.execute(stmt)).scalars().all()
+    try:
+        session = await _get_session_or_404(db, session_id)
+        provider_name = session.llm_provider
+
+        stmt = select(Message).where(Message.session_id == session_id).order_by(Message.created_at)
+        prior_messages = (await db.execute(stmt)).scalars().all()
+    except Exception:
+        # Never reached event_stream()'s own cleanup below — this request is
+        # failing before any StreamingResponse gets returned at all.
+        _active_streams.pop(session_id, None)
+        raise
     history = [ChatMessage(role=m.role, content=m.content) for m in prior_messages if m.role in ("user", "assistant")]
     history.append(ChatMessage(role="user", content=payload.content))
 
@@ -232,43 +286,63 @@ async def send_message_stream(session_id: UUID, payload: MessageCreate, db: Asyn
         # something to lean on, so this generator manages its own session
         # rather than reusing one whose teardown timing relative to the
         # response is ambiguous.
-        async with async_session_factory() as stream_db:
-            stream_session = await stream_db.get(SessionModel, session_id)
-            if stream_session is None:
-                yield json.dumps({"type": "error", "code": "session_not_found", "message": f"No session {session_id}"}) + "\n"
-                return
-            if stream_session.title is None:
-                stream_session.title = _derive_title(payload.content)
+        #
+        # The outer try/finally guarantees _active_streams gets cleaned up
+        # exactly once no matter which path this takes — the early
+        # session-not-found return, a normal completion, or one of the
+        # specific error branches below.
+        try:
+            async with async_session_factory() as stream_db:
+                stream_session = await stream_db.get(SessionModel, session_id)
+                if stream_session is None:
+                    yield json.dumps({"type": "error", "code": "session_not_found", "message": f"No session {session_id}"}) + "\n"
+                    return
+                if stream_session.title is None:
+                    stream_session.title = _derive_title(payload.content)
 
-            try:
-                await _persist_user_message(stream_db, stream_session, payload.content)
+                try:
+                    await _persist_user_message(stream_db, stream_session, payload.content)
 
-                async for event in respond_stream(stream_db, provider_name, history):
-                    if isinstance(event, StreamDelta):
-                        yield json.dumps({"type": "delta", "text": event.text}) + "\n"
-                    elif isinstance(event, StreamDone):
-                        assistant_message, artifact_row = await _persist_assistant_message(
-                            stream_db, stream_session, event.result
-                        )
-                        turn = ChatTurnResponse(
-                            message=MessageOut.model_validate(assistant_message, from_attributes=True),
-                            artifact=ArtifactOut.model_validate(artifact_row, from_attributes=True) if artifact_row else None,
-                        )
-                        yield json.dumps({"type": "done", "turn": turn.model_dump(mode="json")}) + "\n"
-            except ProviderUnavailableError as exc:
-                logger.error("stream_provider_unavailable", error=str(exc))
-                yield json.dumps({"type": "error", "code": "provider_unavailable", "message": str(exc)}) + "\n"
-            except ProviderTimeoutError as exc:
-                logger.error("stream_provider_timeout", error=str(exc))
-                yield json.dumps({"type": "error", "code": "provider_timeout", "message": str(exc)}) + "\n"
-            except EmbeddingError as exc:
-                logger.error("stream_embedding_error", error=str(exc))
-                yield json.dumps({"type": "error", "code": "embedding_unavailable", "message": str(exc)}) + "\n"
-            except Exception as exc:
-                logger.error("stream_unhandled_exception", error=str(exc), exc_info=True)
-                yield json.dumps({"type": "error", "code": "internal_error", "message": "An unexpected error occurred"}) + "\n"
+                    async for event in respond_stream(stream_db, provider_name, history, stop_event=stop_event):
+                        if isinstance(event, StreamDelta):
+                            yield json.dumps({"type": "delta", "text": event.text}) + "\n"
+                        elif isinstance(event, StreamDone):
+                            assistant_message, artifact_row = await _persist_assistant_message(
+                                stream_db, stream_session, event.result
+                            )
+                            turn = _build_turn_response(assistant_message, artifact_row)
+                            yield json.dumps({"type": "done", "turn": turn.model_dump(mode="json")}) + "\n"
+                except ProviderUnavailableError as exc:
+                    logger.error("stream_provider_unavailable", error=str(exc))
+                    yield json.dumps({"type": "error", "code": "provider_unavailable", "message": str(exc)}) + "\n"
+                except ProviderTimeoutError as exc:
+                    logger.error("stream_provider_timeout", error=str(exc))
+                    yield json.dumps({"type": "error", "code": "provider_timeout", "message": str(exc)}) + "\n"
+                except EmbeddingError as exc:
+                    logger.error("stream_embedding_error", error=str(exc))
+                    yield json.dumps({"type": "error", "code": "embedding_unavailable", "message": str(exc)}) + "\n"
+                except Exception as exc:
+                    logger.error("stream_unhandled_exception", error=str(exc), exc_info=True)
+                    yield json.dumps({"type": "error", "code": "internal_error", "message": "An unexpected error occurred"}) + "\n"
+        finally:
+            _active_streams.pop(session_id, None)
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@router.post("/{session_id}/messages/stop", status_code=204)
+async def stop_message_stream(session_id: UUID) -> None:
+    """Signals an in-progress .../messages/stream generation for this session
+    to wrap up early — see respond_stream's stop_event docstring for why this
+    is cooperative rather than cancelling the request. A stopped reply is
+    persisted exactly like a completed one, just shorter, so it survives a
+    reload the same way. No-op (not an error) if nothing is currently
+    generating for this session — most likely it already finished right as
+    the user clicked stop.
+    """
+    stop_event = _active_streams.get(session_id)
+    if stop_event is not None:
+        stop_event.set()
 
 
 @router.post("/{session_id}/ship30", response_model=ChatTurnResponse)
@@ -281,7 +355,4 @@ async def ship30(session_id: UUID, payload: MessageCreate, db: AsyncSession = De
     result = await run_ship30(db, session.llm_provider, ChatMessage(role="user", content=payload.content))
     assistant_message, artifact_row = await _persist_assistant_message(db, session, result)
 
-    return ChatTurnResponse(
-        message=MessageOut.model_validate(assistant_message, from_attributes=True),
-        artifact=ArtifactOut.model_validate(artifact_row, from_attributes=True) if artifact_row else None,
-    )
+    return _build_turn_response(assistant_message, artifact_row)
