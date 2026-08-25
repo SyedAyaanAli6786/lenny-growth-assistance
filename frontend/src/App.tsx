@@ -19,6 +19,18 @@ function pseudoUserId(): string {
   return id;
 }
 
+// Which chat was on screen, so a page refresh lands back there instead of
+// silently falling back to the most recent chat. A blank "New chat" screen
+// is itself a state worth remembering — without the sentinel, refreshing it
+// looked identical to never having picked a chat, and always redirected to
+// list[0].
+const ACTIVE_SESSION_KEY = "lenny_active_session_id";
+const NEW_CHAT_SENTINEL = "new";
+
+function persistActiveSessionId(id: string | null) {
+  localStorage.setItem(ACTIVE_SESSION_KEY, id ?? NEW_CHAT_SENTINEL);
+}
+
 type Theme = "light" | "dark";
 
 function initialTheme(): Theme {
@@ -46,6 +58,12 @@ export default function App() {
   // itself failing, before any session id exists).
   const [draftErrorText, setDraftErrorText] = useState<string | null>(null);
   const [providerPending, setProviderPending] = useState(false);
+  // Provider choice for a chat that doesn't exist in the backend yet (a
+  // fresh "New chat" screen, or first load before any session is created).
+  // Sessions are created lazily on first message (see runTurn), so there's
+  // no session row to PATCH until then — this just tracks the pick locally
+  // and gets applied to the session right after it's created.
+  const [draftProvider, setDraftProvider] = useState<Provider>("ollama");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [theme, setTheme] = useState<Theme>(initialTheme);
@@ -118,13 +136,17 @@ export default function App() {
   const openSession = useCallback(async (id: string) => {
     const detail = await api.getSession(id);
     setActiveSession(detail);
+    persistActiveSessionId(detail.id);
     setArtifact(null);
     setSidebarOpen(false);
   }, []);
 
   useEffect(() => {
     loadSessions().then((list) => {
-      if (list.length > 0) openSession(list[0].id);
+      const stored = localStorage.getItem(ACTIVE_SESSION_KEY);
+      if (stored === NEW_CHAT_SENTINEL) return;
+      if (stored && list.some((s) => s.id === stored)) openSession(stored);
+      else if (list.length > 0) openSession(list[0].id);
     });
   }, [loadSessions, openSession]);
 
@@ -139,12 +161,14 @@ export default function App() {
     // rows behind (reported live: three in a row). Not creating anything
     // until there's an actual message removes the whole failure mode
     // instead of chasing more edge cases in the guard.
+    if (activeSession) setDraftProvider(activeSession.llm_provider);
     setActiveSession(null);
+    persistActiveSessionId(null);
     setArtifact(null);
     setDraftErrorText(null);
     setDraft("");
     setSidebarOpen(false);
-  }, []);
+  }, [activeSession]);
 
   const reportError = useCallback(
     (message: string) => {
@@ -167,6 +191,7 @@ export default function App() {
         if (list.length > 0) await openSession(list[0].id);
         else {
           setActiveSession(null);
+          persistActiveSessionId(null);
           setArtifact(null);
         }
       }
@@ -176,7 +201,10 @@ export default function App() {
 
   const handleProviderChange = useCallback(
     async (provider: Provider) => {
-      if (!activeSession) return;
+      if (!activeSession) {
+        setDraftProvider(provider);
+        return;
+      }
       setProviderPending(true);
       setErrorFor(activeSession.id, null);
       try {
@@ -263,7 +291,12 @@ export default function App() {
         try {
           const created = await api.createSession(undefined, pseudoUserId());
           session = { ...created, messages: [] };
+          if (draftProvider !== created.llm_provider) {
+            const updated = await api.setProvider(created.id, draftProvider);
+            session = { ...session, llm_provider: updated.llm_provider, llm_model: updated.llm_model };
+          }
           setActiveSession(session);
+          persistActiveSessionId(session.id);
         } catch (err) {
           setDraftErrorText(err instanceof ApiError ? err.message : "Could not start a new chat.");
           return;
@@ -292,7 +325,7 @@ export default function App() {
       if (kind === "ship30") await runShip30(session, content, wasUntitled);
       else await runMessage(session, content, wasUntitled);
     },
-    [activeSession, runShip30, runMessage, setErrorFor],
+    [activeSession, draftProvider, runShip30, runMessage, setErrorFor],
   );
 
   const handleStop = useCallback(() => {
@@ -345,14 +378,12 @@ export default function App() {
           )}
         </div>
         <div className="flex items-center gap-2">
-          {activeSession && (
-            <ProviderToggle
-              current={activeSession.llm_provider}
-              health={health}
-              onChange={handleProviderChange}
-              pending={providerPending}
-            />
-          )}
+          <ProviderToggle
+            current={activeSession ? activeSession.llm_provider : draftProvider}
+            health={health}
+            onChange={handleProviderChange}
+            pending={providerPending}
+          />
           <ThemeToggle theme={theme} onToggle={() => setTheme((t) => (t === "dark" ? "light" : "dark"))} />
         </div>
       </header>
