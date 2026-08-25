@@ -55,7 +55,7 @@ async def ingest_file(path: Path) -> None:
     title = post.get("title") or path.stem
     guest = post.get("guest")
     url = post.get("url") or post.get("youtube_url")
-    published_at = _parse_date(post.get("date") or post.get("published_at"))
+    published_at = _parse_date(post.get("date") or post.get("published_at") or post.get("publish_date"))
     slug = _slugify(path.stem)
 
     async with async_session_factory() as db:
