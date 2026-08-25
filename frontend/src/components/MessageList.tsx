@@ -7,9 +7,13 @@ import { CitationList } from "./CitationList";
 interface Props {
   messages: MessageData[];
   pendingLabel: string | null;
+  streamingText: string | null;
   errorText: string | null;
   onSuggestion: (text: string) => void;
 }
+
+const ASSISTANT_BUBBLE_CLASS =
+  "prose prose-sm max-w-none rounded-2xl rounded-tl-sm bg-white px-4 py-2.5 text-slate-900 shadow-sm ring-1 ring-slate-200 prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5 first:prose-p:mt-0 last:prose-p:mb-0 dark:bg-slate-800 dark:text-slate-100 dark:ring-slate-700 dark:prose-invert";
 
 const SUGGESTIONS = [
   "How should I think about activation for a PLG product?",
@@ -89,14 +93,14 @@ function TypingIndicator({ label }: { label: string }) {
   );
 }
 
-export function MessageList({ messages, pendingLabel, errorText, onSuggestion }: Props) {
+export function MessageList({ messages, pendingLabel, streamingText, errorText, onSuggestion }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, pendingLabel, errorText]);
+  }, [messages.length, pendingLabel, streamingText, errorText]);
 
-  if (messages.length === 0 && !pendingLabel && !errorText) {
+  if (messages.length === 0 && !pendingLabel && !streamingText && !errorText) {
     return (
       <div className="flex h-full flex-col items-center justify-center px-6 text-center">
         <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-400 to-brand-600 text-lg font-semibold text-white shadow-sm">
@@ -137,10 +141,7 @@ export function MessageList({ messages, pendingLabel, errorText, onSuggestion }:
                     {m.content}
                   </div>
                 ) : (
-                  <div
-                    className="prose prose-sm max-w-none rounded-2xl rounded-tl-sm bg-white px-4 py-2.5 text-slate-900 shadow-sm ring-1 ring-slate-200 prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5 first:prose-p:mt-0 last:prose-p:mb-0 dark:bg-slate-800 dark:text-slate-100 dark:ring-slate-700 dark:prose-invert"
-                    dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }}
-                  />
+                  <div className={ASSISTANT_BUBBLE_CLASS} dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} />
                 )}
 
                 <div
@@ -163,6 +164,15 @@ export function MessageList({ messages, pendingLabel, errorText, onSuggestion }:
           <li className="flex items-start gap-2.5">
             <AssistantAvatar />
             <TypingIndicator label={pendingLabel} />
+          </li>
+        )}
+
+        {streamingText !== null && (
+          <li className="flex items-start gap-2.5">
+            <AssistantAvatar />
+            <div className="flex min-w-0 max-w-[85%] flex-col items-start">
+              <div className={ASSISTANT_BUBBLE_CLASS} dangerouslySetInnerHTML={{ __html: renderMarkdown(streamingText) }} />
+            </div>
           </li>
         )}
 

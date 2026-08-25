@@ -33,6 +33,7 @@ export default function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [artifact, setArtifact] = useState<ArtifactData | null>(null);
   const [pendingLabel, setPendingLabel] = useState<string | null>(null);
+  const [streamingText, setStreamingText] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [providerPending, setProviderPending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -78,10 +79,42 @@ export default function App() {
   }, [loadSessions, openSession]);
 
   const handleNewSession = useCallback(async () => {
+    // Mirror ChatGPT: don't pile up empty chats. A session's title is only
+    // ever set once its first message lands (see backend _derive_title), so
+    // title === null on the chat that's already open reliably means "nothing
+    // was ever sent here yet" — stay put instead of creating another empty
+    // one. (Deliberately scoped to the currently-open chat only, not a search
+    // across the whole sidebar history — reusing some unrelated old empty
+    // chat from way back would be a surprising place to land, not a "new"
+    // chat from the user's point of view.)
+    if (activeSession?.title === null) {
+      setSidebarOpen(false);
+      return;
+    }
     const session = await api.createSession(undefined, pseudoUserId());
     await loadSessions();
     await openSession(session.id);
-  }, [loadSessions, openSession]);
+  }, [activeSession, loadSessions, openSession]);
+
+  const handleDeleteSession = useCallback(
+    async (id: string) => {
+      try {
+        await api.deleteSession(id);
+      } catch (err) {
+        setErrorText(err instanceof ApiError ? err.message : "Could not delete this chat.");
+        return;
+      }
+      const list = await loadSessions();
+      if (activeSession?.id === id) {
+        if (list.length > 0) await openSession(list[0].id);
+        else {
+          setActiveSession(null);
+          setArtifact(null);
+        }
+      }
+    },
+    [activeSession, loadSessions, openSession],
+  );
 
   const handleProviderChange = useCallback(
     async (provider: Provider) => {
@@ -100,15 +133,61 @@ export default function App() {
     [activeSession],
   );
 
+  const runShip30 = useCallback(
+    async (content: string, wasUntitled: boolean) => {
+      if (!activeSession) return;
+      setPendingLabel(`Drafting Ship 30 essay… (${activeSession.llm_provider})`);
+      try {
+        const turn = await api.generateShip30(activeSession.id, content);
+        setActiveSession((prev) => (prev ? { ...prev, messages: [...prev.messages, turn.message] } : prev));
+        if (turn.artifact) setArtifact(turn.artifact);
+        if (wasUntitled) loadSessions();
+      } catch (err) {
+        setErrorText(
+          err instanceof ApiError
+            ? `${err.message}${err.component ? ` (${err.component})` : ""}`
+            : "Something went wrong talking to the backend.",
+        );
+      } finally {
+        setPendingLabel(null);
+      }
+    },
+    [activeSession, loadSessions],
+  );
+
+  const runMessage = useCallback(
+    async (content: string, wasUntitled: boolean) => {
+      if (!activeSession) return;
+      const sessionId = activeSession.id;
+      setPendingLabel(`${activeSession.llm_provider === "ollama" ? "Ollama" : "Claude"} is thinking…`);
+      setStreamingText("");
+
+      await api.streamMessage(sessionId, content, {
+        onDelta: (text) => {
+          setPendingLabel(null);
+          setStreamingText((prev) => (prev ?? "") + text);
+        },
+        onDone: (turn) => {
+          setPendingLabel(null);
+          setStreamingText(null);
+          setActiveSession((prev) => (prev ? { ...prev, messages: [...prev.messages, turn.message] } : prev));
+          if (turn.artifact) setArtifact(turn.artifact);
+          if (wasUntitled) loadSessions();
+        },
+        onError: (message) => {
+          setPendingLabel(null);
+          setStreamingText(null);
+          setErrorText(message);
+        },
+      });
+    },
+    [activeSession, loadSessions],
+  );
+
   const runTurn = useCallback(
-    async (content: string, kind: "message" | "ship30") => {
+    (content: string, kind: "message" | "ship30") => {
       if (!activeSession) return;
       setErrorText(null);
-      setPendingLabel(
-        kind === "ship30"
-          ? `Drafting Ship 30 essay… (${activeSession.llm_provider})`
-          : `${activeSession.llm_provider === "ollama" ? "Ollama" : "Claude"} is thinking…`,
-      );
 
       // Optimistic user bubble so the UI feels responsive before the reply lands.
       const optimisticUser = {
@@ -121,21 +200,15 @@ export default function App() {
       };
       setActiveSession((prev) => (prev ? { ...prev, messages: [...prev.messages, optimisticUser] } : prev));
 
-      try {
-        const turn = kind === "ship30" ? await api.generateShip30(activeSession.id, content) : await api.sendMessage(activeSession.id, content);
-        setActiveSession((prev) => (prev ? { ...prev, messages: [...prev.messages, turn.message] } : prev));
-        if (turn.artifact) setArtifact(turn.artifact);
-      } catch (err) {
-        setErrorText(
-          err instanceof ApiError
-            ? `${err.message}${err.component ? ` (${err.component})` : ""}`
-            : "Something went wrong talking to the backend.",
-        );
-      } finally {
-        setPendingLabel(null);
-      }
+      // The backend names a session from its first message — refresh the
+      // sidebar list once (after the turn lands) so the new title shows up
+      // without a manual reload.
+      const wasUntitled = activeSession.title === null;
+
+      if (kind === "ship30") runShip30(content, wasUntitled);
+      else runMessage(content, wasUntitled);
     },
-    [activeSession],
+    [activeSession, runShip30, runMessage],
   );
 
   const degraded = health && health.status !== "ok";
@@ -195,18 +268,25 @@ export default function App() {
           />
         )}
         <div className={`${sidebarOpen ? "block" : "hidden"} fixed z-20 h-[calc(100%-49px)] md:relative md:z-auto md:block`}>
-          <SessionSidebar sessions={sessions} activeId={activeSession?.id ?? null} onSelect={openSession} onNew={handleNewSession} />
+          <SessionSidebar
+            sessions={sessions}
+            activeId={activeSession?.id ?? null}
+            onSelect={openSession}
+            onNew={handleNewSession}
+            onDelete={handleDeleteSession}
+          />
         </div>
 
         <main className="flex min-w-0 flex-1 flex-col bg-slate-50 dark:bg-slate-950">
           <MessageList
             messages={activeSession?.messages ?? []}
             pendingLabel={pendingLabel}
+            streamingText={streamingText}
             errorText={errorText}
             onSuggestion={(text) => runTurn(text, "message")}
           />
           <MessageInput
-            disabled={!activeSession || !!pendingLabel}
+            disabled={!activeSession || !!pendingLabel || streamingText !== null}
             value={draft}
             onValueChange={setDraft}
             onSend={(text) => runTurn(text, "message")}
