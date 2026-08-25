@@ -122,6 +122,30 @@ See `tests/manual_test_plan.md` for the UI flows that need a human (rendering, t
 | A grounded question times out (`provider_timeout`, 504) | Expected on CPU-only hardware if it takes longer than `PROVIDER_TIMEOUT_SECONDS` (500s default, sized above the measured worst case for a full Ship 30 essay) — raise it further, or switch to a smaller `OLLAMA_MODEL` for a faster loop. |
 | Answers cite a plausible-looking but *wrong* source (rare) | Retrieval intentionally uses an exact sequential scan, not an approximate index — see the comment in `backend/migrations/versions/0001_initial.py` for why an `ivfflat` index isn't used here (it silently produces wrong nearest-neighbors when built before ingestion, which is confirmed and documented, not a theoretical concern). |
 
+## Extending the system
+
+### Add a new LLM provider
+
+1. Implement the `LLMProvider` interface (`backend/app/agent/base.py`): `generate()`, `generate_stream()`, `is_available()`, plus `name` and `model_name`. `AnthropicProvider` and `OllamaProvider` (`backend/app/agent/`) are the two reference implementations — a third follows the same shape.
+2. Register it in `get_provider()` (`backend/app/agent/orchestrator.py`) — add an `elif name == "your_provider": _PROVIDERS[name] = YourProvider()` branch.
+3. Add its config (base URL / API key / model name) to `Settings` in `backend/app/config.py`, and document the new variables in `.env.example`.
+4. Widen the `Literal["anthropic", "ollama"]` provider type in `backend/app/api/schemas.py` (`ProviderUpdate.provider`) and the matching `Provider` type in `frontend/src/types.ts`, then add an option to `frontend/src/components/ProviderToggle.tsx`.
+5. Nothing else changes: `orchestrator.py`'s retrieval, prompt construction, and citation/artifact parsing are provider-agnostic by design, so a new provider only has to implement generation.
+
+### Add a new skill (beyond Ship 30 for 30)
+
+Follow the pattern in `backend/app/agent/skills/ship30.py`: a structured prompt template (not a one-off string) plus a `validate_*` function that mechanically checks the output against the skill's actual requirements — word count, required structure, required elements — with a repair-prompt builder for one automatic retry rather than silently returning a malformed draft. Wire it up with a new orchestrator function (mirroring `run_ship30()`) and a new endpoint (mirroring `POST /api/sessions/{id}/ship30`).
+
+### Ingest different or additional transcripts
+
+`scripts/ingest.py` is idempotent and re-runnable against any directory of markdown files with YAML frontmatter (`title`, `guest`, `url`/`youtube_url`, `date`/`published_at`/`publish_date`):
+
+```bash
+PYTHONPATH=backend backend/.venv/bin/python3 -m scripts.ingest --path <your-directory>
+```
+
+Unchanged files are skipped (compared via a content hash); changed files have their chunks replaced and re-embedded. To pull more episodes from the source archive (`github.com/ChatPRD/lennys-podcast-transcripts`), clone it, copy the desired `episodes/<guest>/transcript.md` files into `data/transcripts/<slug>.md`, and re-run ingestion — no code changes required.
+
 ## Repository layout
 
 ```
