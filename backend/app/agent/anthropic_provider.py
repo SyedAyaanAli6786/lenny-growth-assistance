@@ -1,6 +1,7 @@
 import asyncio
+from collections.abc import AsyncIterator
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
+from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, StreamEvent, TextBlock, query
 
 from app.agent.base import ChatMessage, LLMProvider, ProviderResponse, ProviderTimeoutError, ProviderUnavailableError
 from app.config import get_settings
@@ -32,16 +33,13 @@ class AnthropicProvider(LLMProvider):
 
     def __init__(self) -> None:
         self.settings = get_settings()
+        self.model_name = self.settings.anthropic_model
 
     async def is_available(self) -> bool:
         return bool(self.settings.anthropic_api_key)
 
-    async def generate(self, system_prompt: str, messages: list[ChatMessage]) -> ProviderResponse:
-        if not await self.is_available():
-            raise ProviderUnavailableError("ANTHROPIC_API_KEY is not configured")
-
-        prompt = _format_history(messages)
-        options = ClaudeAgentOptions(
+    def _options(self, system_prompt: str, *, streaming: bool) -> ClaudeAgentOptions:
+        return ClaudeAgentOptions(
             system_prompt=system_prompt,
             model=self.settings.anthropic_model,
             # No filesystem/bash/network tools: this is a grounded-chat generation
@@ -59,7 +57,20 @@ class AnthropicProvider(LLMProvider):
             allowed_tools=[],
             permission_mode="dontAsk",
             max_turns=1,
+            # SDKPartialAssistantMessage (surfaced here as StreamEvent) events
+            # only get emitted when this is set — otherwise query() only
+            # yields the complete AssistantMessage once Claude finishes the
+            # whole turn, which is fine for generate() but defeats the point
+            # of generate_stream().
+            include_partial_messages=streaming,
         )
+
+    async def generate(self, system_prompt: str, messages: list[ChatMessage]) -> ProviderResponse:
+        if not await self.is_available():
+            raise ProviderUnavailableError("ANTHROPIC_API_KEY is not configured")
+
+        prompt = _format_history(messages)
+        options = self._options(system_prompt, streaming=False)
 
         try:
             collected: list[str] = []
@@ -79,4 +90,38 @@ class AnthropicProvider(LLMProvider):
             logger.error("anthropic_call_failed", error=str(exc))
             raise ProviderUnavailableError(f"Claude Agent SDK call failed: {exc}") from exc
 
-        return ProviderResponse(text="".join(collected).strip(), provider=self.name, model=self.settings.anthropic_model)
+        return ProviderResponse(text="".join(collected).strip(), provider=self.name, model=self.model_name)
+
+    async def generate_stream(self, system_prompt: str, messages: list[ChatMessage]) -> AsyncIterator[str]:
+        if not await self.is_available():
+            raise ProviderUnavailableError("ANTHROPIC_API_KEY is not configured")
+
+        prompt = _format_history(messages)
+        options = self._options(system_prompt, streaming=True)
+
+        # asyncio.wait_for around each __anext__() call (rather than around the
+        # whole query()) times out on a stalled stream without capping a
+        # reply that's still steadily producing events — same idle-timeout
+        # rationale as OllamaProvider.generate_stream.
+        stream = query(prompt=prompt, options=options).__aiter__()
+        try:
+            while True:
+                try:
+                    message = await asyncio.wait_for(stream.__anext__(), timeout=self.settings.provider_timeout_seconds)
+                except StopAsyncIteration:
+                    break
+
+                if not isinstance(message, StreamEvent):
+                    continue
+                event = message.event
+                if event.get("type") != "content_block_delta":
+                    continue
+                delta = event.get("delta") or {}
+                if delta.get("type") == "text_delta" and delta.get("text"):
+                    yield delta["text"]
+        except TimeoutError as exc:
+            logger.error("anthropic_stream_timeout")
+            raise ProviderTimeoutError("Claude Agent SDK call timed out") from exc
+        except Exception as exc:
+            logger.error("anthropic_stream_failed", error=str(exc))
+            raise ProviderUnavailableError(f"Claude Agent SDK call failed: {exc}") from exc

@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,6 +66,55 @@ class OrchestrationResult:
     display_text: str  # what the chat bubble shows — artifact fences replaced with a pointer
 
 
+@dataclass(frozen=True)
+class StreamDelta:
+    """One text chunk produced during respond_stream() — append to the
+    in-progress chat bubble as it arrives."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class StreamDone:
+    """Terminal event from respond_stream(): the same OrchestrationResult
+    respond() would have returned, computed once the full reply is known."""
+
+    result: OrchestrationResult
+
+
+def _citations_from_text(text: str, retrieved: list[RetrievedChunk]) -> list[dict]:
+    used_tags = {f"[S{i}]" for i in range(1, len(retrieved) + 1) if f"[S{i}]" in text}
+    return [
+        {
+            "source_id": c.source_id,
+            "chunk_id": c.chunk_id,
+            "title": c.title,
+            "guest": c.guest,
+            "url": c.url,
+            "score": c.score,
+        }
+        for i, c in enumerate(retrieved, start=1)
+        if not used_tags or f"[S{i}]" in used_tags
+    ]
+
+
+def _finalize(text: str, provider_name: str, model_name: str, retrieved: list[RetrievedChunk]) -> OrchestrationResult:
+    """Shared by respond()/respond_stream(): once the full reply text is
+    known (immediately for a non-streaming call, or after the last delta for
+    a streaming one), citations/artifact/display_text are derived from it
+    identically either way.
+    """
+    citations = _citations_from_text(text, retrieved)
+    artifact = detect_artifact(text)
+    display_text = strip_artifact_fence(text) if artifact else text
+    return OrchestrationResult(
+        response=ProviderResponse(text=text, provider=provider_name, model=model_name),
+        citations=citations,
+        artifact=artifact,
+        display_text=display_text,
+    )
+
+
 def _build_retrieval_query(history: list[ChatMessage]) -> str:
     """A short follow-up like "the 1st one" or "what about that" carries no
     retrievable signal by itself — folding in the prior assistant turn (if
@@ -110,26 +160,48 @@ async def respond(
     provider = get_provider(provider_name)
     provider_response = await provider.generate(system_prompt, history)
 
-    used_tags = {f"[S{i}]" for i in range(1, len(retrieved) + 1) if f"[S{i}]" in provider_response.text}
-    citations = [
-        {
-            "source_id": c.source_id,
-            "chunk_id": c.chunk_id,
-            "title": c.title,
-            "guest": c.guest,
-            "url": c.url,
-            "score": c.score,
-        }
-        for i, c in enumerate(retrieved, start=1)
-        if not used_tags or f"[S{i}]" in used_tags
-    ]
+    return _finalize(provider_response.text, provider_name, provider_response.model, retrieved)
 
-    artifact = detect_artifact(provider_response.text)
-    display_text = strip_artifact_fence(provider_response.text) if artifact else provider_response.text
 
-    return OrchestrationResult(
-        response=provider_response, citations=citations, artifact=artifact, display_text=display_text
-    )
+async def respond_stream(
+    db: AsyncSession,
+    provider_name: str,
+    history: list[ChatMessage],
+    system_prompt_override: str | None = None,
+) -> AsyncIterator[StreamDelta | StreamDone]:
+    """Streaming counterpart to respond(): same retrieve-then-generate
+    behavior and the same final OrchestrationResult shape, but the caller
+    gets each text chunk as soon as the provider produces it instead of
+    waiting for the whole reply. Citations/artifact detection still need the
+    complete text, so those are only computed once, in the terminal
+    StreamDone event.
+    """
+    retrieved = await retrieve(db, _build_retrieval_query(history))
+
+    if not retrieved and system_prompt_override is None:
+        logger.info("no_retrieval_short_circuit", provider=provider_name)
+        decline_text = "The transcripts I have don't cover this — I don't have grounded material to answer from."
+        yield StreamDelta(decline_text)
+        yield StreamDone(
+            OrchestrationResult(
+                response=ProviderResponse(text=decline_text, provider=provider_name, model="n/a (no model call made)"),
+                citations=[],
+                artifact=None,
+                display_text=decline_text,
+            )
+        )
+        return
+
+    system_prompt = system_prompt_override or GROUNDED_SYSTEM_PROMPT.format(sources=_format_sources(retrieved))
+    provider = get_provider(provider_name)
+
+    chunks: list[str] = []
+    async for piece in provider.generate_stream(system_prompt, history):
+        chunks.append(piece)
+        yield StreamDelta(piece)
+
+    full_text = "".join(chunks).strip()
+    yield StreamDone(_finalize(full_text, provider_name, provider.model_name, retrieved))
 
 
 async def run_ship30(db: AsyncSession, provider_name: str, topic_message: ChatMessage) -> OrchestrationResult:
@@ -167,10 +239,4 @@ async def run_ship30(db: AsyncSession, provider_name: str, topic_message: ChatMe
         if not result.ok:
             logger.warning("ship30_repair_still_failing", issues=result.issues, word_count=result.word_count)
 
-    artifact = detect_artifact(draft.text)
-    display_text = strip_artifact_fence(draft.text) if artifact else draft.text
-    citations = [
-        {"source_id": c.source_id, "chunk_id": c.chunk_id, "title": c.title, "guest": c.guest, "url": c.url, "score": c.score}
-        for c in retrieved
-    ]
-    return OrchestrationResult(response=draft, citations=citations, artifact=artifact, display_text=display_text)
+    return _finalize(draft.text, provider_name, draft.model, retrieved)

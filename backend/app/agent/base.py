@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 
@@ -32,9 +33,20 @@ class LLMProvider(ABC):
     """
 
     name: str
+    model_name: str  # set by each implementation's __init__; echoed into ProviderResponse.model
 
     @abstractmethod
     async def generate(self, system_prompt: str, messages: list[ChatMessage]) -> ProviderResponse: ...
+
+    @abstractmethod
+    def generate_stream(self, system_prompt: str, messages: list[ChatMessage]) -> AsyncIterator[str]:
+        """Same generation as generate(), but yields text deltas as they arrive
+        instead of buffering the full reply — lets the chat UI render tokens
+        as they're produced instead of a multi-minute blank wait on CPU-only
+        Ollama. Ship 30 drafting still uses generate(): its validator/repair
+        pass needs a complete draft before it can check word count/headings/
+        takeaway, so there's nothing useful to stream there."""
+        ...
 
     @abstractmethod
     async def is_available(self) -> bool: ...
