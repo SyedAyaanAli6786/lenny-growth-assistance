@@ -112,6 +112,20 @@ async def test_send_message_persists_turn_and_returns_reply(client, patch_provid
     assert roles == ["user", "assistant"]
 
 
+async def test_untagged_reply_gets_no_citations_even_with_marginal_retrieval(client, patch_providers):
+    # Reported live: retrieval clearing the relevance threshold on a weakly
+    # related chunk doesn't mean the model actually used it — a reply that
+    # declines ("I can't help with weather information") carries no [S1]
+    # tags, and the old fallback attached FAKE_CHUNK anyway, showing an
+    # unrelated source under an answer that never referenced it.
+    patch_providers["ollama"]._reply = "I can't help with weather information."
+    session = (await client.post("/api/sessions", json={})).json()
+
+    resp = await client.post(f"/api/sessions/{session['id']}/messages", json={"content": "What's the weather in Tokyo?"})
+    body = resp.json()
+    assert body["message"]["citations"] == []
+
+
 async def _read_ndjson(response) -> list[dict]:
     events = []
     async for line in response.aiter_lines():
@@ -121,7 +135,11 @@ async def _read_ndjson(response) -> list[dict]:
 
 
 async def test_send_message_stream_emits_deltas_then_done(client, patch_providers):
-    patch_providers["ollama"]._reply = "A grounded streamed answer."
+    # Tagged with [S1] so this exercises real citation attribution rather
+    # than the (removed) "no tags -> cite everything" fallback — see
+    # _citations_from_text's docstring for why an untagged reply now gets
+    # zero citations instead.
+    patch_providers["ollama"]._reply = "A grounded streamed answer [S1]."
     session = (await client.post("/api/sessions", json={})).json()
 
     async with client.stream(
@@ -133,8 +151,8 @@ async def test_send_message_stream_emits_deltas_then_done(client, patch_provider
     deltas = [e for e in events if e["type"] == "delta"]
     done = [e for e in events if e["type"] == "done"]
     assert len(done) == 1
-    assert "".join(d["text"] for d in deltas) == "A grounded streamed answer."
-    assert done[0]["turn"]["message"]["content"] == "A grounded streamed answer."
+    assert "".join(d["text"] for d in deltas) == "A grounded streamed answer [S1]."
+    assert done[0]["turn"]["message"]["content"] == "A grounded streamed answer [S1]."
     assert done[0]["turn"]["message"]["role"] == "assistant"
     assert len(done[0]["turn"]["message"]["citations"]) >= 1
 

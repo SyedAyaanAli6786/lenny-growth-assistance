@@ -92,12 +92,21 @@ class StreamRestart:
 
 
 def _citations_from_text(text: str, retrieved: list[RetrievedChunk]) -> list[dict]:
+    """Only cite sources the reply actually tagged with [S1]-style markers.
+
+    Used to fall back to "no tags -> attribute every retrieved chunk" on the
+    theory that a weak model answered correctly but forgot to tag. Reported
+    live: that fallback fires just as readily when a reply has no tags
+    because it *declined* — "I can't help with weather information" carries
+    no [S1] tags either, and every retrieved chunk (whatever weakly matched
+    the query, however irrelevant) got attached to it as if it grounded the
+    decline. Free-text decline phrasing isn't reliable to pattern-match on
+    either (varies by model/provider), so untagged text is now always
+    citation-free — a real but untagged grounded reply under-credits its
+    sources, which is a smaller trust problem than crediting sources a reply
+    never used at all.
+    """
     if not text.strip():
-        # No text means nothing was actually attributed to anything — most
-        # commonly a reply stopped (see the stop_event in respond_stream())
-        # before the model produced its first token. Without this check,
-        # the "model didn't use [S1]-style tags" fallback below would
-        # attach every retrieved chunk as if a citation to a blank message.
         return []
     used_tags = {f"[S{i}]" for i in range(1, len(retrieved) + 1) if f"[S{i}]" in text}
     return [
@@ -110,7 +119,7 @@ def _citations_from_text(text: str, retrieved: list[RetrievedChunk]) -> list[dic
             "score": c.score,
         }
         for i, c in enumerate(retrieved, start=1)
-        if not used_tags or f"[S{i}]" in used_tags
+        if f"[S{i}]" in used_tags
     ]
 
 
@@ -131,16 +140,27 @@ def _finalize(text: str, provider_name: str, model_name: str, retrieved: list[Re
     )
 
 
-def _build_retrieval_query(history: list[ChatMessage]) -> str:
-    """A short follow-up like "the 1st one" or "what about that" carries no
-    retrievable signal by itself — folding in the prior assistant turn (if
-    any) gives the embedding something concrete to match against, since that's
-    almost always what a short follow-up is actually referring to.
+async def _retrieve_for_history(db: AsyncSession, history: list[ChatMessage]) -> list[RetrievedChunk]:
+    """Retrieve grounding for the latest message in a multi-turn conversation.
+
+    Tries the latest message alone first. Only if that clears nothing does it
+    retry with the prior assistant turn folded in — a short follow-up like
+    "the 1st one" or "what about that" carries no retrievable signal by
+    itself, and folding in what it's replying to gives the embedding
+    something concrete to match against. Trying alone-first rather than
+    unconditionally combining matters: an unrelated follow-up in an existing
+    conversation (e.g. "what's the weather in Tokyo" right after a PLG
+    activation discussion) has its own clear, independent meaning that
+    retrieves nothing on its own — but combining it with a long, topically
+    dense prior turn was pulling in that prior turn's unrelated matches
+    instead, which then got misattributed as if they grounded a reply that
+    used none of them.
     """
     latest = history[-1].content
-    if len(history) >= 2 and history[-2].role == "assistant":
-        return f"{history[-2].content}\n\n{latest}"
-    return latest
+    retrieved = await retrieve(db, latest)
+    if retrieved or len(history) < 2 or history[-2].role != "assistant":
+        return retrieved
+    return await retrieve(db, f"{history[-2].content}\n\n{latest}")
 
 
 async def respond(
@@ -152,7 +172,7 @@ async def respond(
     """Deterministic retrieve-then-generate: retrieval never depends on the model
     deciding to call a tool, so grounding behavior is identical across providers.
     """
-    retrieved = await retrieve(db, _build_retrieval_query(history))
+    retrieved = await _retrieve_for_history(db, history)
 
     if not retrieved and system_prompt_override is None:
         # Deterministic decline instead of a prompt-only instruction: testing
@@ -268,7 +288,7 @@ async def respond_stream(
     exception handler on an already-cancelled task, a real asyncio footgun
     (a second cancellation can land mid-cleanup); this design never needs to.
     """
-    retrieved = await retrieve(db, _build_retrieval_query(history))
+    retrieved = await _retrieve_for_history(db, history)
 
     if not retrieved and system_prompt_override is None:
         logger.info("no_retrieval_short_circuit", provider=provider_name)
