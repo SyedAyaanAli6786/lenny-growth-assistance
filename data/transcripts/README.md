@@ -1,6 +1,6 @@
 # Vendored transcript subset
 
-36 episode transcripts vendored from [`ChatPRD/lennys-podcast-transcripts`](https://github.com/ChatPRD/lennys-podcast-transcripts) — the transcript repository the assignment itself links to — selected for topic coverage (growth, activation, pricing, retention, positioning, GTM, PM leadership, AI-native building) and substantial length (20+ minute episodes only).
+50 episode transcripts vendored from [`ChatPRD/lennys-podcast-transcripts`](https://github.com/ChatPRD/lennys-podcast-transcripts) — the transcript repository the assignment itself links to — selected for topic coverage (growth, activation, pricing, retention, positioning, GTM, PM leadership, AI-native building) and substantial length (20+ minute episodes only).
 
 Each file has YAML frontmatter (`title`, `guest`, `url`, `date`) followed by the transcript body, with the source repo's per-second timestamp codes stripped for cleaner chunking while keeping speaker attribution (`Lenny:` / `<Guest name>:`).
 
